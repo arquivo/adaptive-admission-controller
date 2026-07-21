@@ -12,7 +12,7 @@
 
 ## 1. Executive Summary
 
-The Adaptive Admission Controller (AAC) is a dedicated asynchronous reverse-proxy service that sits between the front-end HTTP layer (Apache httpd / future Caddy) and the backend services of arquivo.pt — primarily SolrCloud search clusters, pywb replay, patching workflows, and SavePageNow capture.
+The Adaptive Admission Controller (AAC) is a dedicated asynchronous reverse-proxy service that sits between the front-end HTTP layer (Apache httpd / future Caddy) and the backend services of arquivo.pt — primarily SolrCloud search clusters, pywb replay, patching workflows, and ArchivePageNow capture.
 
 Its purpose is threefold:
 
@@ -33,7 +33,7 @@ The system is not a rate limiter. It is a traffic scheduler combined with an ada
 | **Capacity Controller** | The component that determines how many requests may be in-flight per backend. |
 | **Adaptive Concurrency** | A strategy that adjusts in-flight limits based on observed latency and failure signals rather than static RPS. |
 | **Request Score** | A numeric priority assigned to each request based on user class, network origin, and behavioral signals. |
-| **Weighted Cost** | A model where expensive request types consume multiple capacity tokens (e.g., SavePageNow = 10 tokens). |
+| **Weighted Cost** | A model where expensive request types consume multiple capacity tokens (e.g., ArchivePageNow = 10 tokens). |
 | **Backend Policy** | The complete set of scheduling, capacity, timeout, cost, and rejection rules for one backend. |
 | **ASN** | Autonomous System Number — identifies the ISP or network operator. |
 
@@ -50,9 +50,10 @@ Scrapers and bots use large numbers of IPs — often within the same ISP or subn
 The platform hosts backends with fundamentally different cost and latency profiles:
 
 - **SolrCloud** — every query fans out to all shards; latency is a useful overload signal.
-- **pywb replay** — framed replay is more expensive than no-frame replay; costs vary with page complexity.
-- **Patching** — CPU/IO heavy, poorly latency-predictable; suits a fixed concurrency cap.
-- **SavePageNow** — expensive, externally variable; requires strict upper bounds and isolated capacity.
+- **Framed replay** — pywb with framed wayback.
+- **No framed replay** — pywb with no-frame wayback.
+- **Patching** - pywb with patching that completes the page with missing archived resources.
+- **ArchivePageNow** — pywb that proxies an user.
 
 A single global policy cannot address all these backends correctly.
 
@@ -62,7 +63,7 @@ A single global policy cannot address all these backends correctly.
 
 ### 4.1 Goals
 
-- Protect SolrCloud, pywb, patching, and SavePageNow from overload.
+- Protect SolrCloud, pywb, patching, and ArchivePageNow from overload.
 - Maximize useful throughput while keeping latency within acceptable bounds.
 - Use concurrency-based admission, not RPS-only rate limiting.
 - Support per-backend policies with pluggable capacity controller algorithms.
@@ -104,8 +105,8 @@ A single global policy cannot address all these backends correctly.
    │
    ├──► SolrCloud clusters (adaptive or fixed)
    ├──► pywb replay — framed / no-frame (adaptive or fixed)
-   ├──► Patching (fixed)
-   └──► SavePageNow / capture (fixed or bounded adaptive)
+   ├──► Patching (adaptive or fixed)
+   └──► ArchivePageNow / capture (fixed or bounded adaptive)
 ```
 
 The critical business logic lives entirely in the AAC. Apache httpd and Caddy act only as front-end proxies. pywb is never modified.
@@ -127,7 +128,7 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-010 | The system shall classify each request before admission using path, headers, authentication state, source IP, and request type. | Must |
-| FR-011 | The system shall determine the target backend (SolrCloud, pywb-framed, pywb-noframe, patching, SavePageNow) for each request. | Must |
+| FR-011 | The system shall determine the target backend (SolrCloud, pywb-framed, pywb-noframe, patching, ArchivePageNow) for each request. | Must |
 | FR-012 | The system shall determine the user class for each request: anonymous, authenticated researcher, service account, internal. | Must |
 | FR-013 | The system shall extract or resolve the source ASN/ISP for each request. Local TTL cache acceptable; global accuracy required for abuse signals. | Should |
 | FR-014 | The system shall extract the source country for each request as an auxiliary classification signal. | Should |
@@ -203,7 +204,6 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-060 | Each backend shall have an independently configured policy specifying: controller type, concurrency limits, queue limits, queue timeout, cost model, and scheduling algorithm. | Must |
-| FR-061 | The system shall support runtime policy updates without process restart. | Should |
 | FR-062 | The system shall support a dry-run (observe-only) mode that classifies and scores requests but does not enforce capacity or queue limits. | Could |
 
 **Recommended initial backend policies:**
@@ -211,10 +211,10 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | Backend | Controller | Initial posture | Notes |
 |---|---|---|---|
 | SolrCloud search | Adaptive | Conservative start; learn capacity | p95 target; all requests touch all shards. |
-| pywb framed replay | Adaptive (lower max) | Start fixed; move to adaptive when p95 data available | Higher token cost. |
+| pywb framed replay | Adaptive | Start fixed; move to adaptive when p95 data available | Higher token cost. |
 | pywb no-frame replay | Adaptive | Usually cheaper than framed | Independent p95 target. |
 | Patching | Fixed | Small explicit cap | Heavy, not latency-predictable. |
-| SavePageNow | Fixed or bounded adaptive | Very strict upper bound | High request cost; isolated capacity. |
+| ArchivePageNow | Fixed or bounded adaptive | Very strict upper bound | High request cost; isolated capacity. |
 
 ### 6.8 Observability
 
@@ -252,9 +252,8 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | `/readyz` | GET | Readiness including config and backend reachability. |
 | `/metrics` | GET | Prometheus metrics. |
 | `/admin/backends` | GET | List backends and current policy state. |
-| `/admin/backends/{name}/policy` | GET/PUT | View or update active backend policy. |
+| `/admin/backends/{name}/policy` | GET | View active backend policy. |
 | `/admin/backends/{name}/limit` | GET | Inspect current capacity limit. |
-| `/admin/backends/{name}/drain` | POST | Stop admitting new traffic to a backend. |
 
 Authentication and authorization must be enforced on all `/admin/*` endpoints.
 
@@ -336,7 +335,7 @@ Authentication and authorization must be enforced on all `/admin/*` endpoints.
 
 ### 12.1 MVP Must-Haves
 
-- Backend registry with Solr, pywb (framed + no-frame), patching, and SavePageNow entries.
+- Backend registry with Solr, pywb (framed + no-frame), patching, and ArchivePageNow entries.
 - Request classifier based on path, backend, request type, and authentication metadata.
 - Scoring engine: base score by user class + IP/subnet/ASN/country penalties from Redis.
 - Fixed concurrency controller.

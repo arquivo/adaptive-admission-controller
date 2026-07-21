@@ -481,7 +481,7 @@ Scenarios:
 1. Deploy AAC in shadow mode behind Apache httpd (receive traffic, forward directly, observe metrics without enforcing limits).
 2. Enable dry-run mode (classify and score but do not enforce admission).
 3. Validate that classification, scoring, and metrics are correct against real traffic.
-4. Enable fixed controllers for patching and SavePageNow (low-risk, predictable).
+4. Enable fixed controllers for patching and ArchivePageNow (low-risk, predictable).
 5. Enable fixed controllers for pywb with conservative limits.
 6. Enable adaptive controller for SolrCloud with conservative initial and min limits.
 7. Monitor p95 latency, limit evolution, queue depth, and rejection rate daily for 2 weeks.
@@ -501,7 +501,7 @@ Scenarios:
 | pywb framed | Fixed → Adaptive | 50 | — | — |
 | pywb no-frame | Fixed → Adaptive | 100 | — | — |
 | Patching | Fixed | 10 | — | — |
-| SavePageNow | Fixed | 5 | — | — |
+| ArchivePageNow | Fixed | 5 | — | — |
 
 *These numbers must be validated with production load tests before enforcement.*
 
