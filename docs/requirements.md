@@ -19,6 +19,7 @@ Its purpose is threefold:
 1. **Protect backends from overload** — enforce per-backend concurrency limits that adapt to observed latency and error signals.
 2. **Prioritize legitimate traffic** — score every request across multiple dimensions (authentication, network origin, behavioral patterns, request type) and admit higher-value requests first.
 3. **Mitigate distributed abuse** — penalize traffic bursts aggregated at IP, subnet (/24, IPv6 prefix), ASN/ISP, and country level without requiring hard bans.
+4. **Avoid penalizing the archive's home country** — a configurable set of countries (default: Portugal) is exempt from subnet, ASN/ISP, and country-level penalties, since arquivo.pt's own national traffic is naturally large and diverse and should not be treated as distributed abuse.
 
 The system is not a rate limiter. It is a traffic scheduler combined with an adaptive capacity controller.
 
@@ -36,6 +37,7 @@ The system is not a rate limiter. It is a traffic scheduler combined with an ada
 | **Weighted Cost** | A model where expensive request types consume multiple capacity tokens (e.g., ArchivePageNow = 10 tokens). |
 | **Backend Policy** | The complete set of scheduling, capacity, timeout, cost, and rejection rules for one backend. |
 | **ASN** | Autonomous System Number — identifies the ISP or network operator. |
+| **Exempt Country** | A country (default: Portugal, `PT`) configured to bypass subnet, ASN/ISP, and country-level abuse penalties. Per-IP and per-user penalties still apply. |
 
 ---
 
@@ -45,6 +47,8 @@ arquivo.pt infrastructure faces two related but distinct problems:
 
 ### 3.1 Distributed Abuse
 Scrapers and bots use large numbers of IPs — often within the same ISP or subnet — to stay below per-IP rate limits while collectively exhausting backend concurrency. IP-only rate limiting is insufficient. Geographic blocking is coarse and generates false positives. The solution must aggregate signals at the IP, /24 subnet, ASN, and country level.
+
+Because arquivo.pt is Portugal's national web archive, legitimate Portuguese traffic is itself large-volume and spread across many residential ISPs, subnets, and CGNAT ranges. Applying subnet/ASN/country-level penalties uniformly would misclassify this legitimate national traffic as distributed abuse. The system must therefore support an exempt country list (default: Portugal) that bypasses these aggregate-level penalties while still applying per-IP and per-user penalties.
 
 ### 3.2 Backend Heterogeneity
 The platform hosts backends with fundamentally different cost and latency profiles:
@@ -70,6 +74,7 @@ A single global policy cannot address all these backends correctly.
 - Queue requests when appropriate; return controlled rejection responses when capacity or queue limits are exceeded.
 - Prioritize traffic by authentication status, user class, network origin, and request type.
 - Penalize distributed abuse at subnet and ASN level without permanent hard blocks.
+- Exempt a configurable set of countries (default: Portugal) from subnet, ASN/ISP, and country-level penalties.
 - Expose Prometheus metrics and structured logs for operations and tuning.
 - Support future deployment as multiple replicas with shared state coordination.
 
@@ -140,10 +145,11 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | FR-020 | The system shall assign a numeric priority score to every request before enqueuing. | Must |
 | FR-021 | The score shall derive from a base score per user class and a set of subtracted penalties. | Must |
 | FR-022 | Penalties shall be calculated per dimension: individual IP, IPv4 /24 subnet, IPv6 /48 or /56 prefix, ASN/ISP, country, and authenticated user identity. | Must |
+| FR-022a | The system shall support a configurable exempt-country list (default: `["PT"]`). Requests originating from an exempt country shall not receive subnet (/24, IPv6 prefix), ASN/ISP, or country-level penalties. Per-IP and per-user penalties shall still apply. | Must |
 | FR-023 | Penalties shall be proportional to the request volume from that dimension within configurable time windows (10s, 60s, 300s). | Must |
 | FR-024 | Penalty counters shall be stored in a shared Redis instance visible to all AAC nodes. | Must |
 | FR-025 | Penalty counters shall have TTL equal to the measurement window so they expire automatically. | Must |
-| FR-026 | The system shall log the full score decomposition (base, penalty_ip, penalty_net24, penalty_asn, penalty_country, penalty_user, final_score) per request. | Must |
+| FR-026 | The system shall log the full score decomposition (base, penalty_ip, penalty_net24, penalty_asn, penalty_country, penalty_user, final_score, country_exempt flag) per request. | Must |
 | FR-027 | The score shall be clamped within a configured min/max range (e.g., -100 to 100). | Must |
 
 **Suggested initial base scores by user class:**
@@ -288,6 +294,7 @@ Authentication and authorization must be enforced on all `/admin/*` endpoints.
 - Redis must be a shared/global instance accessible from all AAC nodes.
 - Redis local to a single server is insufficient for distributed abuse mitigation.
 - Redis access must be asynchronous (`redis.asyncio`).
+- Counters for `rl:net24`, `rl:net6`, `rl:asn`, and `rl:country` shall still be incremented for requests from exempt countries (for observability and tuning), but their values shall not be subtracted from the request score.
 
 ---
 
@@ -382,6 +389,7 @@ Authentication and authorization must be enforced on all `/admin/*` endpoints.
 | Multiple replicas over-admit | Backend receives more load than intended | Partition budgets per replica or use Redis token coordination. |
 | Incorrect classification | Wrong priority or backend policy applied | Explicit route rules, integration tests, structured logs for all decisions. |
 | Redis unavailable | Loss of distributed abuse signals | Local fallback counters; alert immediately; Redis HA recommended. |
+| Exempt-country status used to launder distributed abuse | Bots inside the exempt country evade subnet/ASN/country penalties | Per-IP and per-user penalties remain in force for exempt countries; exempt-country traffic is metered separately in metrics/logs for anomaly review; exemption list is admin-configurable, not hardcoded. |
 
 ---
 

@@ -80,6 +80,9 @@ class BackendPolicy(ABC):
 
 ```yaml
 # config/backends.yaml
+scoring:
+  exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
+
 backends:
   - name: solr-main
     upstream_url: http://solr:8983
@@ -205,7 +208,7 @@ HTTP Request
 
 ## 4. Phase 3 — Request Classification and Scoring Engine
 
-**Goal:** Assign meaningful priority scores to every request using Redis-backed counters for IP, subnet, ASN, and country signals.
+**Goal:** Assign meaningful priority scores to every request using Redis-backed counters for IP, subnet, ASN, and country signals, with a configurable exempt-country list (default: Portugal) that skips subnet/ASN/country penalties.
 
 ### 4.1 Request Classifier
 
@@ -234,18 +237,29 @@ BASE_SCORES = {
     UserClass.BOT:            0,
 }
 
-async def calculate_score(ctx: RequestContext, redis: Redis) -> int:
+async def calculate_score(ctx: RequestContext, redis: Redis, config: ScoringConfig) -> int:
     base = BASE_SCORES[ctx.user_class]
+    is_exempt = ctx.country in config.exempt_countries
 
     penalty = 0
-    penalty += await ip_penalty(ctx.source_ip, ctx.backend, redis)
-    penalty += await net24_penalty(ctx.subnet_24, ctx.backend, redis)
-    penalty += await asn_penalty(ctx.asn, ctx.backend, redis)
-    penalty += await country_penalty(ctx.country, ctx.backend, redis)
-    penalty += await user_penalty(ctx.user_id, ctx.backend, redis)
+    penalty_ip = await ip_penalty(ctx.source_ip, ctx.backend, redis)
+    penalty_net24 = await net24_penalty(ctx.subnet_24, ctx.backend, redis)
+    penalty_asn = await asn_penalty(ctx.asn, ctx.backend, redis)
+    penalty_country = await country_penalty(ctx.country, ctx.backend, redis)
+    penalty_user = await user_penalty(ctx.user_id, ctx.backend, redis)
+
+    penalty += penalty_ip
+    penalty += penalty_user
+    if not is_exempt:
+        # Counters above are still incremented (for observability) even when
+        # exempt; only their contribution to the score is skipped here.
+        penalty += penalty_net24
+        penalty += penalty_asn
+        penalty += penalty_country
 
     final = clamp(base - penalty, min_score=-100, max_score=100)
-    ctx.score_breakdown = ScoreBreakdown(base, penalty_ip, ...)
+    ctx.score_breakdown = ScoreBreakdown(base, penalty_ip, penalty_net24, penalty_asn,
+                                          penalty_country, penalty_user, is_exempt, final)
     return final
 ```
 
@@ -276,8 +290,10 @@ rl:user:{uid}:{backend}        TTL = 3600s (daily quota)
 - [ ] Integrate GeoIP/ASN lookup library with local TTL cache.
 - [ ] Implement `ScoreEngine` with Redis async counter increments.
 - [ ] Implement penalty functions per dimension.
+- [ ] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
 - [ ] Log full score decomposition as structured JSON per request.
 - [ ] Unit tests: classification rules, penalty calculation, score clamping.
+- [ ] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
 - [ ] Integration tests: verify score reflects correct Redis counter state.
 
 ---
@@ -402,6 +418,7 @@ Every admission decision emits one JSON log line:
   "source_ip": "1.2.3.4",
   "asn": "AS12345",
   "country": "PT",
+  "country_exempt": true,
   "score": {
     "base": 100,
     "penalty_ip": -10,
@@ -409,7 +426,7 @@ Every admission decision emits one JSON log line:
     "penalty_asn": -20,
     "penalty_country": 0,
     "penalty_user": 0,
-    "final": 70
+    "final": 90
   },
   "cost": 1,
   "queue_wait_ms": 42,
@@ -460,8 +477,9 @@ Scenarios:
 1. **Baseline** — Ramp from 10 to 500 concurrent clients against Solr. Record p95 latency and concurrency limit evolution.
 2. **Priority** — Mix 80% low-score bots and 20% high-score users. Verify high-score users are served faster.
 3. **Distributed abuse** — Many IPs from same ASN. Verify ASN penalty reduces their priority without blocking legitimate traffic.
-4. **Fixed backend** — Saturate patching backend; verify fixed limit holds.
-5. **Recovery** — Remove load after saturation; verify adaptive limit recovers.
+4. **Exempt country** — Many IPs from the same ASN/subnet, all geolocated to an exempt country (e.g., PT). Verify subnet/ASN/country penalties are skipped while per-IP and per-user penalties still apply.
+5. **Fixed backend** — Saturate patching backend; verify fixed limit holds.
+6. **Recovery** — Remove load after saturation; verify adaptive limit recovers.
 
 ### 7.3 Security Hardening
 
