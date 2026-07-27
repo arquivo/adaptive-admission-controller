@@ -161,6 +161,10 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | FR-025 | Penalty counters shall have TTL equal to the measurement window so they expire automatically. | Must |
 | FR-026 | The system shall log the full score decomposition (base, penalty_ip, penalty_net24, penalty_asn, penalty_country, penalty_user, final_score, country_exempt flag) per request. | Must |
 | FR-027 | The score shall be clamped within a configured min/max range (e.g., -100 to 100). | Must |
+| FR-028 | Base scores per user class and penalty thresholds/weights per abuse dimension shall be configurable in a single global default block, rather than hardcoded. | Must |
+| FR-029 | The system shall allow individual backends to override any subset of the global default scoring configuration (e.g., a backend with a higher per-request cost may apply stricter thresholds). Fields not explicitly overridden shall inherit the global default; the override is a deep-merge, not a full replacement. | Should |
+
+Concrete default values and the override mechanism are defined in `config/backends.yaml` (see implementation_plan.md §2.3 and §4.4) — that file is canonical if it ever disagrees with the tables below.
 
 **Suggested initial base scores by user class:**
 
@@ -274,6 +278,34 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 
 Authentication and authorization must be enforced on all `/admin/*` endpoints.
 
+### 6.10 Configuration Management
+
+The AAC has two distinct categories of configuration, sourced differently:
+
+| Category | Contains | Source | Precedence |
+|---|---|---|---|
+| **Policy configuration** | Backend registry, path routing, concurrency limits/bounds, queue limits, scoring weights, penalty thresholds, exempt-country list | A single YAML file (`config/backends.yaml`), version-controlled | Compiled-in Pydantic defaults < YAML file. No environment-variable overrides of individual policy fields — this avoids two disagreeing sources of truth for the same value. |
+| **Secrets & deployment wiring** | Redis connection URL/credentials, admin API auth token, log level, HTTP listen port, path to the policy YAML file itself | Environment variables only | Never written to the YAML file or committed to version control. |
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-080 | The system shall load all backend/scoring policy configuration from a single YAML file at a configurable path (default: `config/backends.yaml`, overridable via the `AAC_CONFIG_PATH` environment variable). | Must |
+| FR-081 | The system shall source all secrets (Redis connection string/credentials, admin API auth token) exclusively from environment variables. Secrets shall never be read from or written to the policy YAML file. | Must |
+| FR-082 | The system shall validate the full configuration (schema types, cross-field constraints such as `min_concurrency <= initial_concurrency <= max_concurrency`, and required secrets present) at startup. | Must |
+| FR-083 | The system shall fail to start (non-zero exit) on invalid or incomplete configuration, and `/readyz` shall report not-ready if configuration failed to load. | Must |
+| FR-084 | For the MVP, configuration changes shall require a process restart to take effect. Runtime hot-reload (via `/admin/*` PUT or signal-triggered reload) is a post-MVP enhancement. | Must |
+| FR-085 | The system shall be deployable as a container image. The policy YAML file shall be injectable via a mounted volume/ConfigMap; secrets shall be injectable via standard container-orchestrator secret mechanisms (e.g., Kubernetes Secrets, Docker secrets) exposed as environment variables. | Must |
+
+**Illustrative environment variables (names to be finalized during implementation):**
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `AAC_CONFIG_PATH` | Path to the policy YAML file | `/etc/aac/backends.yaml` |
+| `AAC_REDIS_URL` | Redis connection string | `redis://:password@redis-global:6379/0` |
+| `AAC_ADMIN_API_TOKEN` | Bearer token/secret for `/admin/*` auth | (secret) |
+| `AAC_LOG_LEVEL` | Structured log verbosity | `INFO` |
+| `AAC_LISTEN_PORT` | HTTP listen port | `8000` |
+
 ---
 
 ## 7. Non-Functional Requirements
@@ -346,6 +378,7 @@ Authentication and authorization must be enforced on all `/admin/*` endpoints.
 - **Multiple active replicas**: each replica must receive a proportional fraction of the backend limit, or use Redis-based token coordination.
 - **Graceful shutdown**: stop accepting new requests, drain queues where feasible, release all in-flight accounting.
 - **Front-end compatibility**: the AAC must be deployable behind Apache httpd today and Caddy in the future without changes to its internal logic.
+- **Containerized deployment**: the AAC ships as a container image; the policy YAML is delivered via mounted volume/ConfigMap, secrets via orchestrator-managed environment variables (see §6.10).
 
 ---
 
@@ -363,12 +396,14 @@ Authentication and authorization must be enforced on all `/admin/*` endpoints.
 - Prometheus metrics per backend and per class.
 - Structured JSON logs: admission, rejection, score decomposition, adaptive limit changes.
 - `/healthz`, `/readyz`, `/metrics` endpoints.
+- Single YAML policy file + environment-variable secrets, validated at startup with fail-fast behavior (§6.10). Restart-only config changes; no runtime hot-reload.
 
 ### 12.2 Post-MVP Enhancements
 
 - Advanced Vegas/Gradient-style adaptive controllers.
 - Distributed token budget coordination (Redis-based, multi-replica).
 - Policy dry-run mode.
+- Runtime hot-reload of policy configuration (`/admin/*` PUT or signal-triggered reload) — MVP requires a restart.
 - Admin dashboard / configuration UI.
 - Per-tenant budgets and quotas.
 - Weighted fair scheduling with anti-starvation guarantees.

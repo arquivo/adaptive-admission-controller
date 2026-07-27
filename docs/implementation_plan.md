@@ -88,6 +88,39 @@ class BackendPolicy(ABC):
 scoring:
   exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
 
+  base_scores:               # per user_class — must match §4.2 UserClass enum
+    anonymous: 100
+    researcher: 80
+    unknown: 50
+    suspicious: 20
+    bot: 0
+
+  score_clamp: {min: -100, max: 100}
+
+  # Global default penalty thresholds, one entry per abuse dimension.
+  # Below soft_threshold: no penalty. Between soft/hard: soft_penalty applies.
+  # At/above hard_threshold: hard_penalty applies. See §4.4 for rationale.
+  default_penalties:
+    ip:      {window_seconds: 10,  soft_threshold: 10,  hard_threshold: 30,   soft_penalty: 10, hard_penalty: 40}
+    net24:   {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}
+    net6:    {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}
+    asn:     {window_seconds: 60,  soft_threshold: 200, hard_threshold: 1000, soft_penalty: 20, hard_penalty: 70}
+    country: {window_seconds: 300, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 5,  hard_penalty: 30}
+    user:    {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 5,  hard_penalty: 40}
+
+  # Per-backend overrides: deep-merge over default_penalties/base_scores above.
+  # Only list the fields/dimensions a backend needs to diverge on; everything
+  # else is inherited unmodified. Backends with no entry here use the global
+  # default as-is. Example: Solr is far more expensive per-request than pywb
+  # replay, so it penalizes abusive IPs sooner and harder.
+  overrides:
+    solr-page-search:
+      penalties:
+        ip: {soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50}
+    solr-image-search:
+      penalties:
+        ip: {soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50}
+
 backends:
   # --- SolrCloud (2 independent clusters, separate hardware/collections) ---
   - name: solr-page-search
@@ -158,15 +191,19 @@ backends:
 
 `upstream_url` hosts/ports above are illustrative placeholders — replace with the actual pywb uwsgi ports and Solr hosts before deployment. `match.path_prefix` for the two Solr backends is left `null` pending confirmation of the real routing convention (dedicated host vs. path vs. query parameter).
 
+**Scoring config resolution:** at startup, each backend's effective scoring config is computed once as `deep_merge(scoring.default_penalties, scoring.overrides.get(backend_name, {}).penalties)` (same for `base_scores` if a backend ever needs to override those too) and cached on the backend's `BackendPolicy` object. Requests never merge configs on the hot path — `calculate_score` (§4.2) always receives an already-resolved, backend-specific config.
+
 ### 2.4 Tasks
 
 - [ ] Initialise Python project (`pyproject.toml`, virtual environment, linting).
 - [ ] Define all ABCs in `interfaces.py`.
 - [ ] Implement `config.py` with Pydantic models for backend policies.
+- [ ] Implement per-backend scoring config resolution (deep-merge `scoring.default_penalties`/`base_scores` with `scoring.overrides.<backend>`, once at startup — see §2.3 "Scoring config resolution").
 - [ ] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling.
 - [ ] Implement pass-through `main.py` that routes requests to the correct upstream.
 - [ ] Add `/healthz` and `/readyz` endpoints.
 - [ ] Write unit tests for config parsing.
+- [ ] Write unit tests for scoring config merge: a backend override touching only one dimension/field leaves all other dimensions and unlisted backends unchanged.
 - [ ] Validate that the app starts and proxies a real or mock backend.
 
 ---
@@ -269,25 +306,19 @@ Inputs extracted per request:
 
 ### 4.2 Scoring Formula
 
-```python
-BASE_SCORES = {
-    UserClass.ANONYMOUS:    100,
-    UserClass.RESEARCHER:    80,
-    UserClass.UNKNOWN:       50,
-    UserClass.SUSPICIOUS:    20,
-    UserClass.BOT:            0,
-}
+`config` below is the backend's already-resolved `ResolvedScoringConfig` (see §2.3 "Scoring config resolution") — `base_scores`, `exempt_countries`, and per-dimension penalty thresholds have already had any `scoring.overrides.<backend>` entries merged in before this function is ever called.
 
-async def calculate_score(ctx: RequestContext, redis: Redis, config: ScoringConfig) -> int:
-    base = BASE_SCORES[ctx.user_class]
+```python
+async def calculate_score(ctx: RequestContext, redis: Redis, config: ResolvedScoringConfig) -> int:
+    base = config.base_scores[ctx.user_class]
     is_exempt = ctx.country in config.exempt_countries
 
     penalty = 0
-    penalty_ip = await ip_penalty(ctx.source_ip, ctx.backend, redis)
-    penalty_net24 = await net24_penalty(ctx.subnet_24, ctx.backend, redis)
-    penalty_asn = await asn_penalty(ctx.asn, ctx.backend, redis)
-    penalty_country = await country_penalty(ctx.country, ctx.backend, redis)
-    penalty_user = await user_penalty(ctx.user_id, ctx.backend, redis)
+    penalty_ip = await ip_penalty(ctx.source_ip, ctx.backend, redis, config.penalties.ip)
+    penalty_net24 = await net24_penalty(ctx.subnet_24, ctx.backend, redis, config.penalties.net24)
+    penalty_asn = await asn_penalty(ctx.asn, ctx.backend, redis, config.penalties.asn)
+    penalty_country = await country_penalty(ctx.country, ctx.backend, redis, config.penalties.country)
+    penalty_user = await user_penalty(ctx.user_id, ctx.backend, redis, config.penalties.user)
 
     penalty += penalty_ip
     penalty += penalty_user
@@ -298,11 +329,13 @@ async def calculate_score(ctx: RequestContext, redis: Redis, config: ScoringConf
         penalty += penalty_asn
         penalty += penalty_country
 
-    final = clamp(base - penalty, min_score=-100, max_score=100)
+    final = clamp(base - penalty, min_score=config.score_clamp.min, max_score=config.score_clamp.max)
     ctx.score_breakdown = ScoreBreakdown(base, penalty_ip, penalty_net24, penalty_asn,
                                           penalty_country, penalty_user, is_exempt, final)
     return final
 ```
+
+Each `*_penalty` function applies the soft/hard step function from its `PenaltyConfig` (window_seconds, soft/hard threshold, soft/hard penalty — see §4.4): below `soft_threshold` → 0; at/above `soft_threshold` and below `hard_threshold` → `soft_penalty`; at/above `hard_threshold` → `hard_penalty`.
 
 ### 4.3 Redis Key Schema
 
@@ -317,10 +350,13 @@ rl:user:{uid}:{backend}        TTL = 3600s (daily quota)
 
 ### 4.4 Penalty Thresholds (Initial Values — tune with production data)
 
+These are the `scoring.default_penalties` values from `config/backends.yaml` (§2.3) — that file is canonical if the two ever disagree. `solr-page-search` and `solr-image-search` override the `ip` row (see `scoring.overrides` in §2.3) since Solr's per-request cost is much higher than pywb's.
+
 | Dimension | Window | Soft threshold | Hard threshold | Soft penalty | Hard penalty |
 |---|---|---|---|---|---|
 | IP | 10s | 10 req | 30 req | -10 | -40 |
 | IPv4 /24 | 60s | 50 req | 200 req | -10 | -40 |
+| IPv6 /48 or /56 | 60s | 50 req | 200 req | -10 | -40 |
 | ASN | 60s | 200 req | 1000 req | -20 | -70 |
 | Country | 300s | 500 req | 2000 req | -5 | -30 |
 | Authenticated user | 60s | 50 req | 200 req | -5 | -40 |
@@ -330,11 +366,12 @@ rl:user:{uid}:{backend}        TTL = 3600s (daily quota)
 - [ ] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
 - [ ] Integrate GeoIP/ASN lookup library with local TTL cache.
 - [ ] Implement `ScoreEngine` with Redis async counter increments.
-- [ ] Implement penalty functions per dimension.
+- [ ] Implement penalty functions per dimension, each taking its resolved `PenaltyConfig` (soft/hard threshold + penalty) rather than hardcoded constants.
 - [ ] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
 - [ ] Log full score decomposition as structured JSON per request.
 - [ ] Unit tests: classification rules, penalty calculation, score clamping.
 - [ ] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
+- [ ] Unit tests: `solr-page-search`/`solr-image-search` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
 - [ ] Integration tests: verify score reflects correct Redis counter state.
 
 ---
