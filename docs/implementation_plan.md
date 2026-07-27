@@ -80,12 +80,22 @@ class BackendPolicy(ABC):
 
 ```yaml
 # config/backends.yaml
+#
+# This file is the canonical reference for default concurrency/queue values.
+# Tables elsewhere in requirements.md / this plan (recommended policies,
+# production initial limits) must stay consistent with these numbers —
+# treat this block as the single source of truth that tests reference.
 scoring:
   exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
 
 backends:
-  - name: solr-main
-    upstream_url: http://solr:8983
+  # --- SolrCloud (2 independent clusters, separate hardware/collections) ---
+  - name: solr-page-search
+    upstream_url: http://solr-page:8983
+    match:
+      # TBD — confirm routing convention (dedicated host, path prefix, or
+      # query parameter) used to distinguish page vs image search requests.
+      path_prefix: null
     controller: adaptive
     min_concurrency: 20
     initial_concurrency: 100
@@ -95,27 +105,58 @@ backends:
     queue_timeout_seconds: 300
     request_cost_model: default
 
+  - name: solr-image-search
+    upstream_url: http://solr-image:8983
+    match:
+      path_prefix: null   # TBD, see solr-page-search above
+    controller: adaptive
+    min_concurrency: 20
+    initial_concurrency: 100
+    max_concurrency: 500
+    target_p95_ms: 100
+    queue_max_size: 5000
+    queue_timeout_seconds: 300
+    request_cost_model: default
+
+  # --- pywb (4 independent uwsgi processes, own port each) ---
   - name: pywb-framed
-    upstream_url: http://pywb:8080
+    upstream_url: http://pywb-framed:8080
+    match:
+      path_prefix: /wayback
     controller: fixed
     concurrency_limit: 100
     queue_max_size: 2000
     queue_timeout_seconds: 300
 
-  - name: patching
-    upstream_url: http://patching:9000
+  - name: pywb-noframe
+    upstream_url: http://pywb-noframe:8081
+    match:
+      path_prefix: /noFrame/replay
+    controller: fixed
+    concurrency_limit: 100
+    queue_max_size: 2000
+    queue_timeout_seconds: 300
+
+  - name: pywb-patching
+    upstream_url: http://pywb-patching:8082
+    match:
+      path_prefix: /noFrame/patching
     controller: fixed
     concurrency_limit: 10
     queue_max_size: 100
     queue_timeout_seconds: 300
 
-  - name: savepage
-    upstream_url: http://savepage:9100
+  - name: pywb-archivepagenow
+    upstream_url: http://pywb-archivepagenow:8083
+    match:
+      path_prefix: /save
     controller: fixed
     concurrency_limit: 5
     queue_max_size: 50
     queue_timeout_seconds: 300
 ```
+
+`upstream_url` hosts/ports above are illustrative placeholders — replace with the actual pywb uwsgi ports and Solr hosts before deployment. `match.path_prefix` for the two Solr backends is left `null` pending confirmation of the real routing convention (dedicated host vs. path vs. query parameter).
 
 ### 2.4 Tasks
 
@@ -216,8 +257,8 @@ Inputs extracted per request:
 
 | Field | Source |
 |---|---|
-| backend | URL path prefix or Host header |
-| request_type | Path pattern (search, replay-framed, replay-noframe, patching, savepage) |
+| backend | Matched against each backend's `match.path_prefix` (pywb) or the TBD Solr routing convention (host/path/param) — see §2.3. Resolves to one of: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. |
+| request_type | Derived from backend: search-page, search-image, replay-framed, replay-noframe, patching, archivepagenow |
 | user_class | Authorization header / session token verification |
 | source_ip | `X-Forwarded-For` or `REMOTE_ADDR` (trust only verified proxy headers) |
 | subnet_24 | Computed from source_ip |
@@ -413,7 +454,7 @@ Every admission decision emits one JSON log line:
 ```json
 {
   "event": "admitted",
-  "backend": "solr-main",
+  "backend": "solr-page-search",
   "user_class": "anonymous",
   "source_ip": "1.2.3.4",
   "asn": "AS12345",
@@ -459,13 +500,13 @@ Every admission decision emits one JSON log line:
 
 ### 7.1 Integration Tests
 
-- [ ] Route real Solr queries through AAC; verify limit is enforced and metrics match.
-- [ ] Route real pywb requests; verify separate queues for framed and no-frame.
-- [ ] Simulate latency injection on Solr; verify adaptive controller reduces limit.
+- [ ] Route real queries through `solr-page-search` and `solr-image-search` independently; verify each limit is enforced and metrics are reported per-backend.
+- [ ] Route real pywb requests through all four paths (`/wayback`, `/noFrame/replay`, `/noFrame/patching`, `/save`); verify each resolves to its own backend queue.
+- [ ] Simulate latency injection on `solr-page-search`; verify its adaptive controller reduces its limit without affecting `solr-image-search`.
 - [ ] Simulate backend 5xx burst; verify limit reduction and error metrics.
 - [ ] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter.
 - [ ] Simulate client disconnect during queue wait; verify Future cancellation.
-- [ ] Verify that Solr saturation does not affect pywb queue.
+- [ ] Verify that saturating any one of the six backends does not affect the other five queues.
 - [ ] Verify that Redis disconnection triggers fallback and alerts.
 
 ### 7.2 Load Testing
@@ -474,7 +515,7 @@ Tools: `locust` or `k6`.
 
 Scenarios:
 
-1. **Baseline** — Ramp from 10 to 500 concurrent clients against Solr. Record p95 latency and concurrency limit evolution.
+1. **Baseline** — Ramp from 10 to 500 concurrent clients against `solr-page-search`, then repeat against `solr-image-search`. Record p95 latency and concurrency limit evolution for each independently.
 2. **Priority** — Mix 80% low-score bots and 20% high-score users. Verify high-score users are served faster.
 3. **Distributed abuse** — Many IPs from same ASN. Verify ASN penalty reduces their priority without blocking legitimate traffic.
 4. **Exempt country** — Many IPs from the same ASN/subnet, all geolocated to an exempt country (e.g., PT). Verify subnet/ASN/country penalties are skipped while per-IP and per-user penalties still apply.
@@ -499,9 +540,9 @@ Scenarios:
 1. Deploy AAC in shadow mode behind Apache httpd (receive traffic, forward directly, observe metrics without enforcing limits).
 2. Enable dry-run mode (classify and score but do not enforce admission).
 3. Validate that classification, scoring, and metrics are correct against real traffic.
-4. Enable fixed controllers for patching and ArchivePageNow (low-risk, predictable).
-5. Enable fixed controllers for pywb with conservative limits.
-6. Enable adaptive controller for SolrCloud with conservative initial and min limits.
+4. Enable fixed controllers for `pywb-patching` and `pywb-archivepagenow` (low-risk, predictable).
+5. Enable fixed controllers for `pywb-framed` and `pywb-noframe` with conservative limits.
+6. Enable adaptive controller for `solr-page-search` and `solr-image-search` independently, each with conservative initial and min limits.
 7. Monitor p95 latency, limit evolution, queue depth, and rejection rate daily for 2 weeks.
 8. Tune thresholds and scoring penalties based on observed production data.
 
@@ -515,13 +556,14 @@ Scenarios:
 
 | Backend | Controller | Initial limit | Min | Max |
 |---|---|---|---|---|
-| SolrCloud | Adaptive | 50 | 10 | 300 |
-| pywb framed | Fixed → Adaptive | 50 | — | — |
-| pywb no-frame | Fixed → Adaptive | 100 | — | — |
-| Patching | Fixed | 10 | — | — |
-| ArchivePageNow | Fixed | 5 | — | — |
+| `solr-page-search` | Adaptive | 50 | 10 | 300 |
+| `solr-image-search` | Adaptive | 50 | 10 | 300 |
+| `pywb-framed` | Fixed → Adaptive | 50 | — | — |
+| `pywb-noframe` | Fixed → Adaptive | 100 | — | — |
+| `pywb-patching` | Fixed | 10 | — | — |
+| `pywb-archivepagenow` | Fixed | 5 | — | — |
 
-*These numbers must be validated with production load tests before enforcement.*
+*These numbers must be validated with production load tests before enforcement. `solr-image-search` currently mirrors `solr-page-search` as a placeholder — no separate baseline exists yet; treat as the least-validated row in this table.*
 
 ---
 
