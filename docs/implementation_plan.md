@@ -26,7 +26,7 @@
 | 1 — Foundation | Project skeleton, interfaces, config model | Tests pass; app starts and proxies a single backend |
 | 2 — Fixed Admission | Fixed capacity controller + priority queue per backend | Load test shows fixed concurrency enforced correctly |
 | 3 — Scoring Engine | Request classifier + Redis-based scoring | Score decomposition visible in logs; penalties applied |
-| 4 — Adaptive Controller | p95-based adaptive concurrency for Solr/pywb | Simulated latency curves drive correct limit changes |
+| 4 — Adaptive Controller | p95-based adaptive concurrency for Search APIs/pywb | Simulated latency curves drive correct limit changes |
 | 5 — Observability | Full Prometheus metrics + structured logs + admin API | Metrics visible in test Grafana; alerts fire correctly |
 | 6 — Integration & Hardening | Real backends in staging; failure-mode tests | Passes load test and failure injection suite |
 | 7 — Production Deploy | Single-instance production rollout | Monitored rollout; baseline metrics captured |
@@ -113,12 +113,13 @@ geoip:
 
 scoring:
   exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
+  ipv6_prefix_length: 56     # /48 or /56 — bucket size for IPv6 abuse aggregation (FR-022); default /56
 
   base_scores:               # per user_class — identity-only enum, see §4.1a
     anonymous: 100
     researcher: 80
-    service_account: 90      # placeholder — not yet validated, see docs/open_tbd.md
-    internal: 100             # placeholder — not yet validated, see docs/open_tbd.md
+    service_account: 90
+    internal: 100
     unknown: 50
 
   score_clamp: {min: -100, max: 100}
@@ -141,52 +142,51 @@ scoring:
     country: [{window_seconds: 300, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 5,  hard_penalty: 30}]
     user:
       - {window_seconds: 60,   soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 5,  hard_penalty: 40}
-      - {window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60}   # placeholder — see docs/open_tbd.md
+      - {window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60}   # best-guess default — tune with production data
 
   # Per-backend overrides: deep-merge over default_penalties/base_scores above.
   # Only list the fields/dimensions a backend needs to diverge on; everything
   # else is inherited unmodified. Backends with no entry here use the global
-  # default as-is. Example: Solr is far more expensive per-request than pywb
-  # replay, so it penalizes abusive IPs sooner and harder.
+  # default as-is. Example: the Search APIs are far more expensive per-request
+  # than pywb replay, so they penalize abusive IPs sooner and harder.
   overrides:
-    solr-page-search:
+    page-search-api:
       penalties:
         ip: {soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50}
-    solr-image-search:
+    image-search-api:
       penalties:
         ip: {soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50}
 
 backends:
-  # --- SolrCloud (2 independent clusters, separate hardware/collections) ---
-  - name: solr-page-search
-    upstream_url: http://solr-page:8983
+  # --- Search APIs (2 independent services, separate hardware/collections;
+  # each talks to its own SolrCloud cluster internally) ---
+  - name: page-search-api
+    upstream_url: http://page-search-api:8080   # environment-specific — see docs/open_tbd.md
     match:
-      # TBD — confirm routing convention (dedicated host, path prefix, or
-      # query parameter) used to distinguish page vs image search requests.
-      path_prefix: null
+      path_prefix: /textsearch
     controller: adaptive
     min_concurrency: 20
     initial_concurrency: 100
     max_concurrency: 500
     target_p95_ms: 100
-    timeout_rate_threshold: 0.05   # placeholder — validate with production data, see docs/open_tbd.md
-    error_rate_threshold: 0.10     # placeholder — validate with production data, see docs/open_tbd.md
+    timeout_rate_threshold: 0.05   # best-guess default — tune with production data
+    error_rate_threshold: 0.10     # best-guess default — tune with production data
     connect_timeout_seconds: 5
     backend_timeout_seconds: 60
     queue_max_size: 5000
     queue_timeout_seconds: 300
 
-  - name: solr-image-search
-    upstream_url: http://solr-image:8983
+  - name: image-search-api
+    upstream_url: http://image-search-api:8080   # environment-specific — see docs/open_tbd.md
     match:
-      path_prefix: null   # TBD, see solr-page-search above
+      path_prefix: /imagesearch
     controller: adaptive
     min_concurrency: 20
     initial_concurrency: 100
     max_concurrency: 500
     target_p95_ms: 100
-    timeout_rate_threshold: 0.05   # placeholder, see solr-page-search above
-    error_rate_threshold: 0.10     # placeholder, see solr-page-search above
+    timeout_rate_threshold: 0.05   # best-guess default, see page-search-api above
+    error_rate_threshold: 0.10     # best-guess default, see page-search-api above
     connect_timeout_seconds: 5
     backend_timeout_seconds: 60
     queue_max_size: 5000
@@ -241,7 +241,7 @@ backends:
     queue_timeout_seconds: 300
 ```
 
-`upstream_url` hosts/ports above are illustrative placeholders — replace with the actual pywb uwsgi ports and Solr hosts before deployment. `match.path_prefix` for the two Solr backends is left `null` pending confirmation of the real routing convention (dedicated host vs. path vs. query parameter). Per-backend `connect_timeout_seconds`/`backend_timeout_seconds` and the adaptive-only `timeout_rate_threshold`/`error_rate_threshold` are likewise placeholders (`requirements.md` FR-053, §6.6) pending production validation — see `docs/open_tbd.md`.
+`upstream_url` hosts/ports above are illustrative placeholders — these are real arquivo.pt services, but the actual host/port for each depends on the server/cluster the AAC is deployed against, so they must be set per environment rather than hardcoded once (see `docs/open_tbd.md`). `match.path_prefix` is resolved for all six backends (all reachable under a single host per environment; Search APIs route by path like pywb — `/textsearch`, `/imagesearch`). Per-backend `connect_timeout_seconds`/`backend_timeout_seconds`, concurrency limits, and the adaptive-only `timeout_rate_threshold`/`error_rate_threshold` are initial best-guess defaults — all require production validation before enforcement (`requirements.md` FR-053, §6.6; see `docs/open_tbd.md`).
 
 **Scoring config resolution:** at startup, each backend's effective scoring config is computed once as `deep_merge(scoring.default_penalties, scoring.overrides.get(backend_name, {}).penalties)` (same for `base_scores` if a backend ever needs to override those too) and cached on the backend's `BackendPolicy` object. Requests never merge configs on the hot path — `calculate_score` (§4.2) always receives an already-resolved, backend-specific config. Every `default_penalties.<dimension>` value, and its resolved counterpart, is a **list** of `PenaltyConfig` windows — the deep-merge for a single-window dimension merges dict-into-dict at index 0; `user`'s two windows are carried through unchanged since no backend overrides them today.
 
@@ -361,7 +361,7 @@ Inputs extracted per request:
 
 | Field | Source |
 |---|---|
-| backend | Matched against each backend's `match.path_prefix` (pywb) or the TBD Solr routing convention (host/path/param) — see §2.3. Matching is longest-prefix-wins (FR-011a); a path matching no configured backend resolves to a `404` response (FR-011c) rather than a backend value. Resolves to one of: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. |
+| backend | Matched against each backend's `match.path_prefix` — see §2.3. Matching is longest-prefix-wins (FR-011a); a path matching no configured backend resolves to a `404` response (FR-011c) rather than a backend value. Resolves to one of: `page-search-api`, `image-search-api`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. |
 | request_type | Derived from backend: search-page, search-image, replay-framed, replay-noframe, patching, archivepagenow |
 | user_class | Authorization header / session token verification |
 | source_ip | Resolved by the trusted-proxy ingress check (`ingress` config, §2.3; FR-010a): the `X-Forwarded-For` entry `xff_trusted_hops` from the right, taken only when `REMOTE_ADDR` is in `trusted_proxies`. A request from an untrusted peer is rejected `403` before it ever reaches the classifier. |
@@ -428,22 +428,22 @@ rl:net6:{prefix6}:{backend}           TTL = 60s
 rl:asn:{asn}:{backend}                TTL = 60s
 rl:country:{cc}:{backend}             TTL = 300s
 rl:user:{uid}:{backend}:60            TTL = 60s    (burst window)
-rl:user:{uid}:{backend}:3600          TTL = 3600s  (sustained window — placeholder thresholds, §4.4)
+rl:user:{uid}:{backend}:3600          TTL = 3600s  (sustained window, §4.4)
 ```
 
 ### 4.4 Penalty Thresholds (Initial Values — tune with production data)
 
-These are the `scoring.default_penalties` values from `config/backends.yaml` (§2.3) — that file is canonical if the two ever disagree. `solr-page-search` and `solr-image-search` override the `ip` row (see `scoring.overrides` in §2.3) since Solr's per-request cost is much higher than pywb's.
+These are the `scoring.default_penalties` values from `config/backends.yaml` (§2.3) — that file is canonical if the two ever disagree. `page-search-api` and `image-search-api` override the `ip` row (see `scoring.overrides` in §2.3) since the Search APIs' per-request cost is much higher than pywb's.
 
 | Dimension | Window | Soft threshold | Hard threshold | Soft penalty | Hard penalty |
 |---|---|---|---|---|---|
 | IP | 10s | 10 req | 30 req | -10 | -40 |
 | IPv4 /24 | 60s | 50 req | 200 req | -10 | -40 |
-| IPv6 /48 or /56 | 60s | 50 req | 200 req | -10 | -40 |
+| IPv6 prefix (`/56` default, `/48` configurable) | 60s | 50 req | 200 req | -10 | -40 |
 | ASN | 60s | 200 req | 1000 req | -20 | -70 |
 | Country | 300s | 500 req | 2000 req | -5 | -30 |
 | Authenticated user — burst | 60s | 50 req | 200 req | -5 | -40 |
-| Authenticated user — sustained *(placeholder)* | 3600s | 500 req | 2000 req | -10 | -60 |
+| Authenticated user — sustained | 3600s | 500 req | 2000 req | -10 | -60 |
 
 `user` is the only dimension with more than one window (§4.2, A7 in `docs/decision_log.md`) — the burst and sustained rows above are both applied and summed, never chosen between.
 
@@ -458,7 +458,7 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 - [ ] Log full score decomposition as structured JSON per request.
 - [ ] Unit tests: classification rules, penalty calculation, score clamping.
 - [ ] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
-- [ ] Unit tests: `solr-page-search`/`solr-image-search` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
+- [ ] Unit tests: `page-search-api`/`image-search-api` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
 - [ ] Unit tests: the `user` dimension sums penalties across its 60s and 3600s windows independently (e.g. hard on the burst window + soft on the sustained window ⇒ both penalties applied).
 - [ ] Integration tests: verify score reflects correct Redis counter state.
 
@@ -466,7 +466,7 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 
 ## 5. Phase 4 — Adaptive Concurrency Controller
 
-**Goal:** Implement a p95-based adaptive concurrency controller for SolrCloud and pywb backends.
+**Goal:** Implement a p95-based adaptive concurrency controller for the Search API and pywb backends.
 
 ### 5.1 Latency Sampling
 
@@ -632,7 +632,7 @@ Every admission decision emits one JSON log line:
 ```json
 {
   "event": "admitted",
-  "backend": "solr-page-search",
+  "backend": "page-search-api",
   "user_class": "anonymous",
   "source_ip": "1.2.3.4",
   "asn": "AS12345",
@@ -677,11 +677,11 @@ Every admission decision emits one JSON log line:
 
 ### 7.1 Integration Tests
 
-- [ ] Route real queries through `solr-page-search` and `solr-image-search` independently; verify each limit is enforced and metrics are reported per-backend.
+- [ ] Route real queries through `page-search-api` and `image-search-api` independently; verify each limit is enforced and metrics are reported per-backend.
 - [ ] Route real pywb requests through all four paths (`/wayback`, `/noFrame/replay`, `/noFrame/patching`, `/save`); verify each resolves to its own backend queue.
 - [ ] Verify longest-prefix-wins routing: a request path matching two configured prefixes (e.g. `/noFrame/patching` vs. a hypothetical bare `/noFrame`) resolves to the backend with the longer, more specific prefix (FR-011a).
 - [ ] Verify a request path matching no configured backend returns `404` without being enqueued or scored (FR-011c).
-- [ ] Simulate latency injection on `solr-page-search`; verify its adaptive controller reduces its limit without affecting `solr-image-search`.
+- [ ] Simulate latency injection on `page-search-api`; verify its adaptive controller reduces its limit without affecting `image-search-api`.
 - [ ] Simulate backend 5xx burst; verify limit reduction and error metrics.
 - [ ] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter.
 - [ ] Simulate client disconnect during queue wait; verify Future cancellation.
@@ -694,7 +694,7 @@ Tools: `locust` or `k6`.
 
 Scenarios:
 
-1. **Baseline** — Ramp from 10 to 500 concurrent clients against `solr-page-search`, then repeat against `solr-image-search`. Record p95 latency and concurrency limit evolution for each independently.
+1. **Baseline** — Ramp from 10 to 500 concurrent clients against `page-search-api`, then repeat against `image-search-api`. Record p95 latency and concurrency limit evolution for each independently.
 2. **Priority** — Mix 80% low-score bots and 20% high-score users. Verify high-score users are served faster.
 3. **Distributed abuse** — Many IPs from same ASN. Verify ASN penalty reduces their priority without blocking legitimate traffic.
 4. **Exempt country** — Many IPs from the same ASN/subnet, all geolocated to an exempt country (e.g., PT). Verify subnet/ASN/country penalties are skipped while per-IP and per-user penalties still apply.
@@ -722,7 +722,7 @@ Scenarios:
 3. Validate that classification, scoring, and metrics are correct against real traffic.
 4. Enable fixed controllers for `pywb-patching` and `pywb-archivepagenow` (low-risk, predictable).
 5. Enable fixed controllers for `pywb-framed` and `pywb-noframe` with conservative limits.
-6. Enable adaptive controller for `solr-page-search` and `solr-image-search` independently, each with conservative initial and min limits.
+6. Enable adaptive controller for `page-search-api` and `image-search-api` independently, each with conservative initial and min limits.
 7. Monitor p95 latency, limit evolution, queue depth, and rejection rate daily for 2 weeks.
 8. Tune thresholds and scoring penalties based on observed production data.
 9. Run `scripts/update_geoip_db.py` to refresh the local GeoIP/ASN database, then perform a rolling restart to pick it up (FR-013a) — establish this as a recurring operational step; the exact cadence/automation is outside the scope of this document.
@@ -737,14 +737,14 @@ Scenarios:
 
 | Backend | Controller | Initial limit | Min | Max |
 |---|---|---|---|---|
-| `solr-page-search` | Adaptive | 50 | 10 | 300 |
-| `solr-image-search` | Adaptive | 50 | 10 | 300 |
+| `page-search-api` | Adaptive | 50 | 10 | 300 |
+| `image-search-api` | Adaptive | 50 | 10 | 300 |
 | `pywb-framed` | Fixed → Adaptive | 50 | — | — |
 | `pywb-noframe` | Fixed → Adaptive | 100 | — | — |
 | `pywb-patching` | Fixed | 10 | — | — |
 | `pywb-archivepagenow` | Fixed | 5 | — | — |
 
-*These numbers must be validated with production load tests before enforcement. `solr-image-search` currently mirrors `solr-page-search` as a placeholder — no separate baseline exists yet; treat as the least-validated row in this table.*
+*These numbers must be validated with production load tests before enforcement. `image-search-api` currently mirrors `page-search-api` as a placeholder — no separate baseline exists yet; treat as the least-validated row in this table.*
 
 ---
 

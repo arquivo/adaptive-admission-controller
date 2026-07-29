@@ -12,7 +12,7 @@
 
 ## 1. Executive Summary
 
-The Adaptive Admission Controller (AAC) is a dedicated asynchronous reverse-proxy service that sits between the front-end HTTP layer (Apache httpd / future Caddy) and six independent backend processes of arquivo.pt: two SolrCloud clusters (page search, image search) and four pywb instances (framed replay, no-frame replay, patching, ArchivePageNow/SavePageNow), each running as its own process on its own port. See §3.2 for the full backend inventory and §6.2 for path-to-backend routing.
+The Adaptive Admission Controller (AAC) is a dedicated asynchronous reverse-proxy service that sits between the front-end HTTP layer (Apache httpd / future Caddy) and six independent backend processes of arquivo.pt: two Search API services (page search, image search — each backed by its own SolrCloud cluster) and four pywb instances (framed replay, no-frame replay, patching, ArchivePageNow/SavePageNow), each running as its own process on its own port. See §3.2 for the full backend inventory and §6.2 for path-to-backend routing.
 
 Its purpose is threefold:
 
@@ -55,8 +55,8 @@ The platform hosts six independent backend processes with fundamentally differen
 
 | # | Backend name | Process | Cost/latency profile |
 |---|---|---|---|
-| 1 | `solr-page-search` | SolrCloud cluster (dedicated hardware) | Every query fans out to all shards; latency is a useful overload signal. |
-| 2 | `solr-image-search` | SolrCloud cluster (separate dedicated hardware, separate collections) | Independent capacity and latency profile from page search; must not share a policy or concurrency budget with it. |
+| 1 | `page-search-api` | Page Search API service (dedicated hardware; talks to its own SolrCloud cluster internally) | Every query fans out to all shards; latency is a useful overload signal. |
+| 2 | `image-search-api` | Image Search API service (separate dedicated hardware; talks to its own SolrCloud cluster, separate collections) | Independent capacity and latency profile from page search; must not share a policy or concurrency budget with it. |
 | 3 | `pywb-framed` | pywb uwsgi process, own port | Framed wayback replay. |
 | 4 | `pywb-noframe` | pywb uwsgi process, own port | No-frame wayback replay. |
 | 5 | `pywb-patching` | pywb uwsgi process, own port | Patching — completes a page with missing archived resources. |
@@ -72,7 +72,7 @@ A single global policy cannot address all these backends correctly.
 
 ### 4.1 Goals
 
-- Protect SolrCloud, pywb, patching, and ArchivePageNow from overload.
+- Protect the Search APIs (page/image), pywb, patching, and ArchivePageNow from overload.
 - Maximize useful throughput while keeping latency within acceptable bounds.
 - Use concurrency-based admission, not RPS-only rate limiting.
 - Support per-backend policies with pluggable capacity controller algorithms.
@@ -85,7 +85,7 @@ A single global policy cannot address all these backends correctly.
 
 ### 4.2 Non-Goals
 
-- Does not replace internal queues inside SolrCloud, pywb, or other backends.
+- Does not replace internal queues inside the Search APIs' SolrCloud clusters, pywb, or other backends.
 - Does not implement machine-learning-based autoscaling in the initial version.
 - Does not require distributed consensus for capacity budgets in single-instance deployment.
 - Does not implement every adaptive concurrency algorithm in the literature for the MVP.
@@ -115,8 +115,8 @@ A single global policy cannot address all these backends correctly.
    │  │  Metrics Collector (Prometheus)           │
    │  └──────────────────────────────────────────┘
    │
-   ├──► SolrCloud page search (adaptive or fixed)
-   ├──► SolrCloud image search (adaptive or fixed)
+   ├──► Page Search API (adaptive or fixed)
+   ├──► Image Search API (adaptive or fixed)
    ├──► pywb framed replay (adaptive or fixed)
    ├──► pywb no-frame replay (adaptive or fixed)
    ├──► pywb patching (fixed)
@@ -143,9 +143,8 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 |---|---|---|
 | FR-010 | The system shall classify each request before admission using path, headers, authentication state, source IP, and request type. | Must |
 | FR-010a | The system shall resolve the client source IP from `X-Forwarded-For` only when the directly-connecting peer (`REMOTE_ADDR`) is present in a configured trusted-proxy allowlist; the client IP is the rightmost `X-Forwarded-For` entry by default, with the number of trusted hops configurable. A request whose peer is not on the allowlist shall be rejected with `403 Forbidden` rather than falling back to `REMOTE_ADDR`. | Must |
-| FR-011 | The system shall determine the target backend for each request from: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. | Must |
-| FR-011a | The system shall determine the target pywb backend from the request path prefix: `/wayback` → `pywb-framed`; `/noFrame/replay` → `pywb-noframe`; `/noFrame/patching` → `pywb-patching`; `/save` → `pywb-archivepagenow`. Matching is **longest-prefix-wins**: among all configured backends, the request path resolves to the backend whose `path_prefix` is the longest match, so a more specific prefix (e.g. `/noFrame/patching`) takes precedence over a shorter one that also matches (e.g. a hypothetical bare `/noFrame`). | Must |
-| FR-011b | The system shall determine the target Solr backend (`solr-page-search` vs `solr-image-search`) from [routing convention TBD — host, path prefix, or query parameter; to be confirmed]. | Must |
+| FR-011 | The system shall determine the target backend for each request from: `page-search-api`, `image-search-api`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. | Must |
+| FR-011a | The system shall determine the target backend from the request path prefix: `/textsearch` → `page-search-api`; `/imagesearch` → `image-search-api`; `/wayback` → `pywb-framed`; `/noFrame/replay` → `pywb-noframe`; `/noFrame/patching` → `pywb-patching`; `/save` → `pywb-archivepagenow`. All six backends are reachable under a single host per environment, so path prefix alone is sufficient to route every request. Matching is **longest-prefix-wins**: among all configured backends, the request path resolves to the backend whose `path_prefix` is the longest match, so a more specific prefix (e.g. `/noFrame/patching`) takes precedence over a shorter one that also matches (e.g. a hypothetical bare `/noFrame`). | Must |
 | FR-011c | The system shall return HTTP `404 Not Found` for any request whose path does not match any configured backend's route, without enqueueing or scoring it. | Must |
 | FR-012 | The system shall determine the user class for each request from a fixed identity set: anonymous, authenticated researcher, service account, internal, or unknown (verification failed or ambiguous). | Must |
 | FR-013 | The system shall extract or resolve the source ASN/ISP for each request. Local TTL cache acceptable; global accuracy required for abuse signals. | Should |
@@ -158,7 +157,7 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 |---|---|---|
 | FR-020 | The system shall assign a numeric priority score to every request before enqueuing. | Must |
 | FR-021 | The score shall derive from a base score per user class and a set of subtracted penalties. | Must |
-| FR-022 | Penalties shall be calculated per dimension: individual IP, IPv4 /24 subnet, IPv6 /48 or /56 prefix, ASN/ISP, country, and authenticated user identity. | Must |
+| FR-022 | Penalties shall be calculated per dimension: individual IP, IPv4 /24 subnet, IPv6 prefix (configurable `/48` or `/56`; default `/56`), ASN/ISP, country, and authenticated user identity. | Must |
 | FR-022a | The system shall support a configurable exempt-country list (default: `["PT"]`). Requests originating from an exempt country shall not receive subnet (/24, IPv6 prefix), ASN/ISP, or country-level penalties. Per-IP and per-user penalties shall still apply. | Must |
 | FR-023 | Penalties shall be proportional to the request volume from that dimension within one or more configurable time windows. A dimension may track multiple independent windows simultaneously (e.g. the authenticated-user dimension tracks both a 60s burst window and a 3600s sustained window); each window's soft/hard step function contributes independently to the total penalty for that dimension. | Must |
 | FR-024 | Penalty counters shall be stored in a shared Redis instance visible to all AAC nodes. | Must |
@@ -178,8 +177,8 @@ Concrete default values and the override mechanism are defined in `config/backen
 |---|---|---|
 | Anonymous | 100 | Protect the casual public experience. |
 | Authenticated researcher | 80 | Legitimate but intensive; above the unknown/unverified tier. |
-| Service account | 90 *(placeholder — see `docs/open_tbd.md`)* | Trusted, pre-vetted automation (e.g. internal harvesting/monitoring clients). |
-| Internal | 100 *(placeholder — see `docs/open_tbd.md`)* | arquivo.pt's own infrastructure; fully trusted. |
+| Service account | 90 | Trusted, pre-vetted automation (e.g. internal harvesting/monitoring clients). |
+| Internal | 100 | arquivo.pt's own infrastructure; fully trusted. |
 | Unknown | 40–60 | Verification failed or ambiguous; no strong signal, mid-range priority. |
 
 A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-027; `config/backends.yaml`, implementation_plan.md §2.3) regardless of its identity class — that clamped floor, not a separate class, is what sends it to the back of the queue to time out under sustained load.
@@ -233,14 +232,14 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 
 | Backend | Connect timeout | Response timeout |
 |---|---|---|
-| `solr-page-search` | 5s | 60s |
-| `solr-image-search` | 5s | 60s |
+| `page-search-api` | 5s | 60s |
+| `image-search-api` | 5s | 60s |
 | `pywb-framed` | 5s | 60s |
 | `pywb-noframe` | 5s | 60s |
 | `pywb-patching` | 5s | 60s |
 | `pywb-archivepagenow` | 10s | 120s |
 
-`pywb-archivepagenow` gets a longer timeout because ArchivePageNow performs a live capture of the target page rather than serving from the existing archive — it is expected to take substantially longer than a Solr query or archived-page replay.
+`pywb-archivepagenow` gets a longer timeout because ArchivePageNow performs a live capture of the target page rather than serving from the existing archive — it is expected to take substantially longer than a Search API query or archived-page replay.
 
 ### 6.7 Backend Policies
 
@@ -253,8 +252,8 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 
 | Backend | Path/route | Controller | Initial posture | Notes |
 |---|---|---|---|---|
-| `solr-page-search` | TBD | Adaptive | Conservative start; learn capacity | p95 target; all requests touch all shards. |
-| `solr-image-search` | TBD | Adaptive | Conservative start; learn capacity | Separate cluster/hardware from page search; independent p95 target and limits. |
+| `page-search-api` | `/textsearch` | Adaptive | Conservative start; learn capacity | p95 target; all requests touch all shards. |
+| `image-search-api` | `/imagesearch` | Adaptive | Conservative start; learn capacity | Separate cluster/hardware from page search; independent p95 target and limits. |
 | `pywb-framed` | `/wayback` | Fixed → Adaptive | Start fixed; move to adaptive when p95 data available | Higher token cost. |
 | `pywb-noframe` | `/noFrame/replay` | Fixed → Adaptive | Usually cheaper than framed | Independent p95 target. |
 | `pywb-patching` | `/noFrame/patching` | Fixed | Small explicit cap | Heavy, not latency-predictable. |
@@ -414,11 +413,11 @@ The AAC has two distinct categories of configuration, sourced differently:
 
 ### 12.1 MVP Must-Haves
 
-- Backend registry with all six backends: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`.
+- Backend registry with all six backends: `page-search-api`, `image-search-api`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`.
 - Request classifier based on path, backend, request type, and authentication metadata.
 - Scoring engine: base score by user class + IP/subnet/ASN/country/user penalties from Redis, with multi-window penalty tracking per dimension (FR-023) and uniform request cost = 1 (FR-046 weighted cost is post-MVP).
 - Fixed concurrency controller.
-- Simple adaptive concurrency controller (p95-based) for SolrCloud and pywb.
+- Simple adaptive concurrency controller (p95-based) for the Search APIs and pywb.
 - Priority queue per backend with score ordering and FIFO tie-breaking.
 - Bounded queues and queue timeout (default 300s).
 - Prometheus metrics per backend and per class.
@@ -445,7 +444,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - Unit tests for request classification and cost estimation rules.
 - Unit tests for fixed and adaptive capacity controller state transitions.
 - Simulated latency curves to verify adaptive limit growth and reduction behaviour.
-- Load tests against each of the six backends independently (`solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`) to establish safe initial limits.
+- Load tests against each of the six backends independently (`page-search-api`, `image-search-api`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`) to establish safe initial limits.
 - Tests for queue timeout, backend timeout, cancellation, and client disconnect.
 - Fairness tests verifying that high-score traffic is served before low-score traffic.
 - Tests verifying that degraded backends do not affect unrelated backend queues.
