@@ -96,7 +96,9 @@ ingress:
   # Peers (REMOTE_ADDR) allowed to set X-Forwarded-For — the front-end
   # Apache/Caddy IP(s). A request from any other peer is rejected 403
   # before classification/scoring ever runs (FR-010a).
-  trusted_proxies: ["127.0.0.1"]   # placeholder — set to the real front-end IP(s)/CIDRs
+  trusted_proxies: ["127.0.0.1", "::1"]   # default: localhost (IPv4 + IPv6) for a
+    # co-located front-end; installation-dependent — set to the real front-end
+    # IP(s)/CIDRs when Apache/Caddy runs on a separate host
   # Client IP = the X-Forwarded-For entry this many hops from the right.
   # Default 1 (rightmost = the hop immediately before the trusted proxy).
   # Raise only if more than one trusted proxy is chained in front of the AAC.
