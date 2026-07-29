@@ -17,7 +17,7 @@ The Adaptive Admission Controller (AAC) is a dedicated asynchronous reverse-prox
 Its purpose is threefold:
 
 1. **Protect backends from overload** — enforce per-backend concurrency limits that adapt to observed latency and error signals.
-2. **Prioritize legitimate traffic** — score every request across multiple dimensions (authentication, network origin, behavioral patterns, request type) and admit higher-value requests first.
+2. **Prioritize legitimate traffic** — score every request across multiple dimensions (authentication, network origin, request type) and admit higher-value requests first.
 3. **Mitigate distributed abuse** — penalize traffic bursts aggregated at IP, subnet (/24, IPv6 prefix), ASN/ISP, and country level without requiring hard bans.
 4. **Avoid penalizing the archive's home country** — a configurable set of countries (default: Portugal) is exempt from subnet, ASN/ISP, and country-level penalties, since arquivo.pt's own national traffic is naturally large and diverse and should not be treated as distributed abuse.
 
@@ -33,8 +33,8 @@ The system is not a rate limiter. It is a traffic scheduler combined with an ada
 | **Traffic Scheduler** | The component that selects which queued request runs next. |
 | **Capacity Controller** | The component that determines how many requests may be in-flight per backend. |
 | **Adaptive Concurrency** | A strategy that adjusts in-flight limits based on observed latency and failure signals rather than static RPS. |
-| **Request Score** | A numeric priority assigned to each request based on user class, network origin, and behavioral signals. |
-| **Weighted Cost** | A model where expensive request types consume multiple capacity tokens (e.g., ArchivePageNow = 10 tokens). |
+| **Request Score** | A numeric priority assigned to each request based on user class and network-origin abuse signals (IP, subnet, ASN, country, authenticated-user identity). |
+| **Weighted Cost** | **Post-MVP.** A model where expensive request types would consume multiple capacity tokens (e.g., a hypothetical ArchivePageNow = 10 tokens). MVP uses a uniform cost of 1 for every request; backend protection comes from fixed/adaptive concurrency limits alone (see FR-046). |
 | **Backend Policy** | The complete set of scheduling, capacity, timeout, cost, and rejection rules for one backend. |
 | **ASN** | Autonomous System Number — identifies the ISP or network operator. |
 | **Exempt Country** | A country (default: Portugal, `PT`) configured to bypass subnet, ASN/ISP, and country-level abuse penalties. Per-IP and per-user penalties still apply. |
@@ -92,6 +92,7 @@ A single global policy cannot address all these backends correctly.
 - Does not solve caching; caching is handled by other layers.
 - Does not permanently block traffic by country or IP alone (except via explicit operational overrides outside this system).
 - Does not manage blue/green branch switching, cross-branch replication, or cross-branch coordination (see §3.2); the AAC operates against the six backends of a single active branch.
+- Does not enforce maximum request body or header size. The front-end web server (Apache httpd today, Caddy in the future) already enforces these limits; duplicating them in the AAC is out of scope (see FR-054 for the streaming requirement, which is a distinct concern from a size limit).
 
 ---
 
@@ -141,11 +142,14 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-010 | The system shall classify each request before admission using path, headers, authentication state, source IP, and request type. | Must |
+| FR-010a | The system shall resolve the client source IP from `X-Forwarded-For` only when the directly-connecting peer (`REMOTE_ADDR`) is present in a configured trusted-proxy allowlist; the client IP is the rightmost `X-Forwarded-For` entry by default, with the number of trusted hops configurable. A request whose peer is not on the allowlist shall be rejected with `403 Forbidden` rather than falling back to `REMOTE_ADDR`. | Must |
 | FR-011 | The system shall determine the target backend for each request from: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. | Must |
-| FR-011a | The system shall determine the target pywb backend from the request path prefix: `/wayback` → `pywb-framed`; `/noFrame/replay` → `pywb-noframe`; `/noFrame/patching` → `pywb-patching`; `/save` → `pywb-archivepagenow`. | Must |
+| FR-011a | The system shall determine the target pywb backend from the request path prefix: `/wayback` → `pywb-framed`; `/noFrame/replay` → `pywb-noframe`; `/noFrame/patching` → `pywb-patching`; `/save` → `pywb-archivepagenow`. Matching is **longest-prefix-wins**: among all configured backends, the request path resolves to the backend whose `path_prefix` is the longest match, so a more specific prefix (e.g. `/noFrame/patching`) takes precedence over a shorter one that also matches (e.g. a hypothetical bare `/noFrame`). | Must |
 | FR-011b | The system shall determine the target Solr backend (`solr-page-search` vs `solr-image-search`) from [routing convention TBD — host, path prefix, or query parameter; to be confirmed]. | Must |
-| FR-012 | The system shall determine the user class for each request: anonymous, authenticated researcher, service account, internal. | Must |
+| FR-011c | The system shall return HTTP `404 Not Found` for any request whose path does not match any configured backend's route, without enqueueing or scoring it. | Must |
+| FR-012 | The system shall determine the user class for each request from a fixed identity set: anonymous, authenticated researcher, service account, internal, or unknown (verification failed or ambiguous). | Must |
 | FR-013 | The system shall extract or resolve the source ASN/ISP for each request. Local TTL cache acceptable; global accuracy required for abuse signals. | Should |
+| FR-013a | The system shall resolve ASN/country from a local GeoIP/ASN database file (path configurable). It shall never fetch this database from a remote service at AAC startup or during normal operation. Refreshing the database is an explicit, separate operational action (a standalone command that downloads a new database to the configured path) run independently of the AAC process; the AAC picks up a refreshed database only on its next restart. | Must |
 | FR-014 | The system shall extract the source country for each request as an auxiliary classification signal. | Should |
 
 ### 6.3 Request Scoring
@@ -156,7 +160,7 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | FR-021 | The score shall derive from a base score per user class and a set of subtracted penalties. | Must |
 | FR-022 | Penalties shall be calculated per dimension: individual IP, IPv4 /24 subnet, IPv6 /48 or /56 prefix, ASN/ISP, country, and authenticated user identity. | Must |
 | FR-022a | The system shall support a configurable exempt-country list (default: `["PT"]`). Requests originating from an exempt country shall not receive subnet (/24, IPv6 prefix), ASN/ISP, or country-level penalties. Per-IP and per-user penalties shall still apply. | Must |
-| FR-023 | Penalties shall be proportional to the request volume from that dimension within configurable time windows (10s, 60s, 300s). | Must |
+| FR-023 | Penalties shall be proportional to the request volume from that dimension within one or more configurable time windows. A dimension may track multiple independent windows simultaneously (e.g. the authenticated-user dimension tracks both a 60s burst window and a 3600s sustained window); each window's soft/hard step function contributes independently to the total penalty for that dimension. | Must |
 | FR-024 | Penalty counters shall be stored in a shared Redis instance visible to all AAC nodes. | Must |
 | FR-025 | Penalty counters shall have TTL equal to the measurement window so they expire automatically. | Must |
 | FR-026 | The system shall log the full score decomposition (base, penalty_ip, penalty_net24, penalty_asn, penalty_country, penalty_user, final_score, country_exempt flag) per request. | Must |
@@ -166,15 +170,19 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 
 Concrete default values and the override mechanism are defined in `config/backends.yaml` (see implementation_plan.md §2.3 and §4.4) — that file is canonical if it ever disagrees with the tables below.
 
+`UserClass` is an identity-only classification — it reflects *who is asking*, not *how they are behaving*. There is no separate "suspicious" or "bot" base class and no upfront bot-detection step: a client that behaves abusively is still one of the five classes below, and is driven toward the back of the queue by the per-IP/subnet/ASN/country/user penalties in FR-022 as its behavior accumulates. This avoids double-counting the same abuse signal as both an identity guess and a penalty.
+
 **Suggested initial base scores by user class:**
 
 | User Class | Base Score | Rationale |
 |---|---|---|
-| Anonymous occasional user | 100 | Protect the casual public experience. |
-| Authenticated researcher | 80 | Legitimate but intensive; above bots, below casuals. |
-| Unknown / unclassified | 40–60 | No strong signal; mid-range priority. |
-| Suspicious (elevated penalties) | 10–30 | Can be served but degraded. |
-| Identified bot | 0 or negative | Goes to the back of the queue and will time out under load. |
+| Anonymous | 100 | Protect the casual public experience. |
+| Authenticated researcher | 80 | Legitimate but intensive; above the unknown/unverified tier. |
+| Service account | 90 *(placeholder — see `docs/open_tbd.md`)* | Trusted, pre-vetted automation (e.g. internal harvesting/monitoring clients). |
+| Internal | 100 *(placeholder — see `docs/open_tbd.md`)* | arquivo.pt's own infrastructure; fully trusted. |
+| Unknown | 40–60 | Verification failed or ambiguous; no strong signal, mid-range priority. |
+
+A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-027; `config/backends.yaml`, implementation_plan.md §2.3) regardless of its identity class — that clamped floor, not a separate class, is what sends it to the back of the queue to time out under sustained load.
 
 ### 6.4 Traffic Scheduling
 
@@ -197,7 +205,7 @@ Concrete default values and the override mechanism are defined in `config/backen
 | FR-043 | The adaptive controller shall use slow increases (e.g., +5%) and faster decreases (e.g., -10% to -30%) to minimize oscillation. | Must |
 | FR-044 | The adaptive controller shall enforce minimum and maximum concurrency bounds per backend. | Must |
 | FR-045 | The adaptive controller shall enter a cooldown period after large decreases to prevent rapid oscillation. | Must |
-| FR-046 | The system shall support configurable request cost units so that expensive request types consume multiple tokens. | Should |
+| FR-046 | **Post-MVP.** The system shall support configurable request cost units so that expensive request types consume multiple tokens. MVP uses a uniform cost of 1 for every request type (see Weighted Cost, §2 Glossary). | Could |
 | FR-047 | All capacity controller types shall implement a common interface (acquire, release, current_limit). | Must |
 
 **Adaptive controller adjustment table:**
@@ -218,13 +226,28 @@ Concrete default values and the override mechanism are defined in `config/backen
 | FR-050 | The system shall forward admitted requests to the target backend using async HTTP with connection pooling. | Must |
 | FR-051 | The system shall record response latency, status code, and timeout status for every dispatched request and report them to the capacity controller. | Must |
 | FR-052 | The system shall release capacity tokens immediately after receiving the backend response or detecting a timeout. | Must |
+| FR-053 | The system shall enforce a configurable per-backend upstream dispatch timeout — a connect timeout and a response timeout — bounding how long it waits for the backend's HTTP response. This is distinct from the queue-wait timeout (FR-034), which only bounds time spent waiting in the priority queue before dispatch begins. A request that exceeds the dispatch timeout is treated as a backend timeout (FR-051, FR-052) and receives a controlled `503` response. | Must |
+| FR-054 | The system shall stream request and response bodies between client and backend rather than buffering them fully in memory, to avoid excessive memory use when serving large archived resources (e.g. video WARC records). | Must |
+
+**Recommended per-backend dispatch timeout defaults (placeholder — validate with production data; see `docs/open_tbd.md`):**
+
+| Backend | Connect timeout | Response timeout |
+|---|---|---|
+| `solr-page-search` | 5s | 60s |
+| `solr-image-search` | 5s | 60s |
+| `pywb-framed` | 5s | 60s |
+| `pywb-noframe` | 5s | 60s |
+| `pywb-patching` | 5s | 60s |
+| `pywb-archivepagenow` | 10s | 120s |
+
+`pywb-archivepagenow` gets a longer timeout because ArchivePageNow performs a live capture of the target page rather than serving from the existing archive — it is expected to take substantially longer than a Solr query or archived-page replay.
 
 ### 6.7 Backend Policies
 
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-060 | Each backend shall have an independently configured policy specifying: controller type, concurrency limits, queue limits, queue timeout, cost model, and scheduling algorithm. | Must |
-| FR-062 | The system shall support a dry-run (observe-only) mode that classifies and scores requests but does not enforce capacity or queue limits. | Could |
+| FR-061 | The system shall support a dry-run (observe-only) mode that classifies and scores requests but does not enforce capacity or queue limits. | Could |
 
 **Recommended initial backend policies:**
 
@@ -232,8 +255,8 @@ Concrete default values and the override mechanism are defined in `config/backen
 |---|---|---|---|---|
 | `solr-page-search` | TBD | Adaptive | Conservative start; learn capacity | p95 target; all requests touch all shards. |
 | `solr-image-search` | TBD | Adaptive | Conservative start; learn capacity | Separate cluster/hardware from page search; independent p95 target and limits. |
-| `pywb-framed` | `/wayback` | Adaptive | Start fixed; move to adaptive when p95 data available | Higher token cost. |
-| `pywb-noframe` | `/noFrame/replay` | Adaptive | Usually cheaper than framed | Independent p95 target. |
+| `pywb-framed` | `/wayback` | Fixed → Adaptive | Start fixed; move to adaptive when p95 data available | Higher token cost. |
+| `pywb-noframe` | `/noFrame/replay` | Fixed → Adaptive | Usually cheaper than framed | Independent p95 target. |
 | `pywb-patching` | `/noFrame/patching` | Fixed | Small explicit cap | Heavy, not latency-predictable. |
 | `pywb-archivepagenow` | `/save` | Fixed or bounded adaptive | Very strict upper bound | High request cost; isolated capacity. |
 
@@ -265,12 +288,16 @@ Concrete default values and the override mechanism are defined in `config/backen
 | `score_distribution` | Histogram | Distribution of request scores by backend. |
 | `queue_wait_duration_seconds` | Histogram | Time requests spend waiting in queue. |
 
+`admission_rejected_total` additionally carries a `reason` label (e.g. `queue_full`, `capacity_full`, `backend_unavailable`) distinguishing why a request was rejected.
+
+`admission_requests_total`, `admission_admitted_total`, `admission_rejected_total`, and `score_distribution` additionally carry an `exempt` label (`true`/`false`) reflecting whether the request's source country is in the configured exempt-country list (FR-022a). Exempt-country traffic is still counted in these metrics' existing totals — the label adds a breakdown dimension, it does not exclude or redirect the count — which is what makes the §14 "metered separately... for anomaly review" mitigation real.
+
 ### 6.9 Administrative API
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/healthz` | GET | Basic process health. |
-| `/readyz` | GET | Readiness including config and backend reachability. |
+| `/readyz` | GET | Readiness: config valid + Redis reachable. Per-backend reachability is reported separately (`/admin/backends`, metrics) and does not gate this endpoint — see FR-083a. |
 | `/metrics` | GET | Prometheus metrics. |
 | `/admin/backends` | GET | List backends and current policy state. |
 | `/admin/backends/{name}/policy` | GET | View active backend policy. |
@@ -293,6 +320,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 | FR-081 | The system shall source all secrets (Redis connection string/credentials, admin API auth token) exclusively from environment variables. Secrets shall never be read from or written to the policy YAML file. | Must |
 | FR-082 | The system shall validate the full configuration (schema types, cross-field constraints such as `min_concurrency <= initial_concurrency <= max_concurrency`, and required secrets present) at startup. | Must |
 | FR-083 | The system shall fail to start (non-zero exit) on invalid or incomplete configuration, and `/readyz` shall report not-ready if configuration failed to load. | Must |
+| FR-083a | `/readyz` shall also report not-ready if the configured Redis instance is unreachable. `/readyz` shall NOT factor individual backend reachability into its status — a down backend affects only its own path (503) and is reported separately via `/admin/backends` and metrics, so one dead backend does not pull the whole AAC out of orchestrator rotation. | Must |
 | FR-084 | For the MVP, configuration changes shall require a process restart to take effect. Runtime hot-reload (via `/admin/*` PUT or signal-triggered reload) is a post-MVP enhancement. | Must |
 | FR-085 | The system shall be deployable as a container image. The policy YAML file shall be injectable via a mounted volume/ConfigMap; secrets shall be injectable via standard container-orchestrator secret mechanisms (e.g., Kubernetes Secrets, Docker secrets) exposed as environment variables. | Must |
 
@@ -326,13 +354,12 @@ The AAC has two distinct categories of configuration, sourced differently:
 
 | Key Pattern | Purpose | TTL |
 |---|---|---|
-| `rl:ip:{ip}:{backend}` | Request count per IP per backend | Window duration (10s / 60s) |
+| `rl:ip:{ip}:{backend}` | Request count per IP per backend | Window duration (10s) |
 | `rl:net24:{prefix}:{backend}` | Request count per IPv4 /24 per backend | Window duration |
 | `rl:net6:{prefix}:{backend}` | Request count per IPv6 prefix per backend | Window duration |
 | `rl:asn:{asn}:{backend}` | Request count per ASN per backend | Window duration |
 | `rl:country:{cc}:{backend}` | Request count per country per backend | Window duration (60s / 300s) |
-| `rl:user:{id}:{backend}` | Request count per authenticated user per backend | Window duration / daily |
-| `rl:behavior:{fingerprint}:{backend}` | Behavioral pattern signals | Configurable |
+| `rl:user:{id}:{backend}:{window_seconds}` | Request count per authenticated user per backend, tracked across multiple independent windows (e.g. 60s burst + 3600s sustained) | = that window's `window_seconds` |
 
 - Redis must be a shared/global instance accessible from all AAC nodes.
 - Redis local to a single server is insufficient for distributed abuse mitigation.
@@ -367,7 +394,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 | Queue full | Reject with controlled 503 response. | Must |
 | Controller overload | Apply admission rejection before internal process collapse. | Must |
 | Configuration error | Fail `/readyz`; avoid accepting traffic under invalid configuration. | Must |
-| Redis unavailable | Fall back to local counters with degraded distributed visibility; log alert. | Should |
+| Redis unavailable | Scoring fails open (base score only, zero penalties); fixed/adaptive concurrency limits keep protecting backends unchanged; `/readyz` reports not-ready (FR-083a); alert immediately. | Must |
 | Metrics failure | Continue serving; log degraded observability. | Should |
 
 ---
@@ -379,6 +406,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - **Graceful shutdown**: stop accepting new requests, drain queues where feasible, release all in-flight accounting.
 - **Front-end compatibility**: the AAC must be deployable behind Apache httpd today and Caddy in the future without changes to its internal logic.
 - **Containerized deployment**: the AAC ships as a container image; the policy YAML is delivered via mounted volume/ConfigMap, secrets via orchestrator-managed environment variables (see §6.10).
+- **GeoIP/ASN database refresh**: the AAC only ever reads the local GeoIP/ASN database file at startup (FR-013a); it never downloads it. Refreshing the file is a separate, explicit operational action, typically run before a rolling restart; integrating that action into the broader deployment/release process is outside the scope of this document.
 
 ---
 
@@ -388,7 +416,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 
 - Backend registry with all six backends: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`.
 - Request classifier based on path, backend, request type, and authentication metadata.
-- Scoring engine: base score by user class + IP/subnet/ASN/country penalties from Redis.
+- Scoring engine: base score by user class + IP/subnet/ASN/country/user penalties from Redis, with multi-window penalty tracking per dimension (FR-023) and uniform request cost = 1 (FR-046 weighted cost is post-MVP).
 - Fixed concurrency controller.
 - Simple adaptive concurrency controller (p95-based) for SolrCloud and pywb.
 - Priority queue per backend with score ordering and FIFO tie-breaking.
@@ -408,6 +436,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - Per-tenant budgets and quotas.
 - Weighted fair scheduling with anti-starvation guarantees.
 - Automated policy recommendation from production metrics.
+- Weighted request cost model (per-request-type token costs, FR-046) — MVP uses a uniform cost of 1 for every request (see §2 Glossary, Weighted Cost).
 
 ---
 
@@ -434,7 +463,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 | Backend latency spikes externally | Adaptive controller reduces capacity unnecessarily | Strict min limits, smoothing windows, separate timeout/error signals. |
 | Multiple replicas over-admit | Backend receives more load than intended | Partition budgets per replica or use Redis token coordination. |
 | Incorrect classification | Wrong priority or backend policy applied | Explicit route rules, integration tests, structured logs for all decisions. |
-| Redis unavailable | Loss of distributed abuse signals | Local fallback counters; alert immediately; Redis HA recommended. |
+| Redis unavailable | Loss of distributed abuse signals | Scoring fails open (base score only); capacity limiters (Redis-independent) keep protecting backends; `/readyz` flips not-ready (FR-083a) to signal upstream HA/alerting; Redis HA recommended. |
 | Exempt-country status used to launder distributed abuse | Bots inside the exempt country evade subnet/ASN/country penalties | Per-IP and per-user penalties remain in force for exempt countries; exempt-country traffic is metered separately in metrics/logs for anomaly review; exemption list is admin-configurable, not hardcoded. |
 
 ---

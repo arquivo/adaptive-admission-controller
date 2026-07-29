@@ -54,6 +54,8 @@ adaptive-admission-controller/
 │   └── integration/
 ├── config/
 │   └── backends.yaml            # Example backend policy configuration
+├── scripts/
+│   └── update_geoip_db.py       # Standalone GeoIP/ASN DB refresh — never invoked by the AAC itself (FR-013a)
 ├── Dockerfile
 ├── docker-compose.yml
 └── pyproject.toml / requirements.txt
@@ -63,8 +65,13 @@ adaptive-admission-controller/
 
 ```python
 class CapacityController(ABC):
-    async def acquire(self, cost: int = 1) -> bool: ...
-    def release(self, cost: int, latency_ms: float, status_code: int, timed_out: bool) -> None: ...
+    # acquire() BLOCKS until `cost` tokens are available — it never returns
+    # False, so a caller can never forget to check a return value (the bug
+    # class that originally motivated this interface). Implementations must
+    # wake blocked waiters whenever current_limit() increases at runtime
+    # (see AdaptiveController, §5.2).
+    async def acquire(self, cost: int = 1) -> None: ...
+    async def release(self, cost: int, latency_ms: float, status_code: int, timed_out: bool) -> None: ...
     def current_limit(self) -> int: ...
 
 class Scheduler(ABC):
@@ -85,28 +92,56 @@ class BackendPolicy(ABC):
 # Tables elsewhere in requirements.md / this plan (recommended policies,
 # production initial limits) must stay consistent with these numbers —
 # treat this block as the single source of truth that tests reference.
+ingress:
+  # Peers (REMOTE_ADDR) allowed to set X-Forwarded-For — the front-end
+  # Apache/Caddy IP(s). A request from any other peer is rejected 403
+  # before classification/scoring ever runs (FR-010a).
+  trusted_proxies: ["127.0.0.1"]   # placeholder — set to the real front-end IP(s)/CIDRs
+  # Client IP = the X-Forwarded-For entry this many hops from the right.
+  # Default 1 (rightmost = the hop immediately before the trusted proxy).
+  # Raise only if more than one trusted proxy is chained in front of the AAC.
+  xff_trusted_hops: 1
+
+geoip:
+  # Local MaxMind GeoLite2 file the AAC reads at startup for ASN/country
+  # lookups (FR-013, FR-013a). The AAC never downloads this file itself —
+  # see scripts/update_geoip_db.py (§4.5) for the separate, explicit refresh
+  # command, run independently of the AAC process (typically before a
+  # rolling restart); integrating that command into deployment automation
+  # is out of scope here (§8.1).
+  db_path: /var/lib/aac/GeoLite2-City.mmdb   # placeholder — set to the real deployment path
+
 scoring:
   exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
 
-  base_scores:               # per user_class — must match §4.2 UserClass enum
+  base_scores:               # per user_class — identity-only enum, see §4.1a
     anonymous: 100
     researcher: 80
+    service_account: 90      # placeholder — not yet validated, see docs/open_tbd.md
+    internal: 100             # placeholder — not yet validated, see docs/open_tbd.md
     unknown: 50
-    suspicious: 20
-    bot: 0
 
   score_clamp: {min: -100, max: 100}
 
-  # Global default penalty thresholds, one entry per abuse dimension.
+  # Global default penalty thresholds. Each dimension is a LIST of one or
+  # more independent windows — most dimensions need only one, but `user`
+  # tracks both a short burst window and a long sustained-abuse window
+  # (no daily quota/hard-cutoff concept exists; see docs/decision_log.md A7).
   # Below soft_threshold: no penalty. Between soft/hard: soft_penalty applies.
-  # At/above hard_threshold: hard_penalty applies. See §4.4 for rationale.
+  # At/above hard_threshold: hard_penalty applies. Per-window penalties for
+  # the same dimension are summed (§4.2). A backend override that targets
+  # a single-window dimension (ip/net24/net6/asn/country) merges as a plain
+  # dict into that one window; overriding one of `user`'s two windows
+  # specifically is not needed by any backend yet.
   default_penalties:
-    ip:      {window_seconds: 10,  soft_threshold: 10,  hard_threshold: 30,   soft_penalty: 10, hard_penalty: 40}
-    net24:   {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}
-    net6:    {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}
-    asn:     {window_seconds: 60,  soft_threshold: 200, hard_threshold: 1000, soft_penalty: 20, hard_penalty: 70}
-    country: {window_seconds: 300, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 5,  hard_penalty: 30}
-    user:    {window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 5,  hard_penalty: 40}
+    ip:      [{window_seconds: 10,  soft_threshold: 10,  hard_threshold: 30,   soft_penalty: 10, hard_penalty: 40}]
+    net24:   [{window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}]
+    net6:    [{window_seconds: 60,  soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 10, hard_penalty: 40}]
+    asn:     [{window_seconds: 60,  soft_threshold: 200, hard_threshold: 1000, soft_penalty: 20, hard_penalty: 70}]
+    country: [{window_seconds: 300, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 5,  hard_penalty: 30}]
+    user:
+      - {window_seconds: 60,   soft_threshold: 50,  hard_threshold: 200,  soft_penalty: 5,  hard_penalty: 40}
+      - {window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60}   # placeholder — see docs/open_tbd.md
 
   # Per-backend overrides: deep-merge over default_penalties/base_scores above.
   # Only list the fields/dimensions a backend needs to diverge on; everything
@@ -134,9 +169,12 @@ backends:
     initial_concurrency: 100
     max_concurrency: 500
     target_p95_ms: 100
+    timeout_rate_threshold: 0.05   # placeholder — validate with production data, see docs/open_tbd.md
+    error_rate_threshold: 0.10     # placeholder — validate with production data, see docs/open_tbd.md
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
     queue_max_size: 5000
     queue_timeout_seconds: 300
-    request_cost_model: default
 
   - name: solr-image-search
     upstream_url: http://solr-image:8983
@@ -147,9 +185,12 @@ backends:
     initial_concurrency: 100
     max_concurrency: 500
     target_p95_ms: 100
+    timeout_rate_threshold: 0.05   # placeholder, see solr-page-search above
+    error_rate_threshold: 0.10     # placeholder, see solr-page-search above
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
     queue_max_size: 5000
     queue_timeout_seconds: 300
-    request_cost_model: default
 
   # --- pywb (4 independent uwsgi processes, own port each) ---
   - name: pywb-framed
@@ -158,6 +199,8 @@ backends:
       path_prefix: /wayback
     controller: fixed
     concurrency_limit: 100
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
     queue_max_size: 2000
     queue_timeout_seconds: 300
 
@@ -167,6 +210,8 @@ backends:
       path_prefix: /noFrame/replay
     controller: fixed
     concurrency_limit: 100
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
     queue_max_size: 2000
     queue_timeout_seconds: 300
 
@@ -176,6 +221,8 @@ backends:
       path_prefix: /noFrame/patching
     controller: fixed
     concurrency_limit: 10
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
     queue_max_size: 100
     queue_timeout_seconds: 300
 
@@ -185,13 +232,18 @@ backends:
       path_prefix: /save
     controller: fixed
     concurrency_limit: 5
+    # Longer than the other five backends: ArchivePageNow performs a live
+    # capture of the target page rather than serving from the existing
+    # archive, so it is expected to take substantially longer per request.
+    connect_timeout_seconds: 10
+    backend_timeout_seconds: 120
     queue_max_size: 50
     queue_timeout_seconds: 300
 ```
 
-`upstream_url` hosts/ports above are illustrative placeholders — replace with the actual pywb uwsgi ports and Solr hosts before deployment. `match.path_prefix` for the two Solr backends is left `null` pending confirmation of the real routing convention (dedicated host vs. path vs. query parameter).
+`upstream_url` hosts/ports above are illustrative placeholders — replace with the actual pywb uwsgi ports and Solr hosts before deployment. `match.path_prefix` for the two Solr backends is left `null` pending confirmation of the real routing convention (dedicated host vs. path vs. query parameter). Per-backend `connect_timeout_seconds`/`backend_timeout_seconds` and the adaptive-only `timeout_rate_threshold`/`error_rate_threshold` are likewise placeholders (`requirements.md` FR-053, §6.6) pending production validation — see `docs/open_tbd.md`.
 
-**Scoring config resolution:** at startup, each backend's effective scoring config is computed once as `deep_merge(scoring.default_penalties, scoring.overrides.get(backend_name, {}).penalties)` (same for `base_scores` if a backend ever needs to override those too) and cached on the backend's `BackendPolicy` object. Requests never merge configs on the hot path — `calculate_score` (§4.2) always receives an already-resolved, backend-specific config.
+**Scoring config resolution:** at startup, each backend's effective scoring config is computed once as `deep_merge(scoring.default_penalties, scoring.overrides.get(backend_name, {}).penalties)` (same for `base_scores` if a backend ever needs to override those too) and cached on the backend's `BackendPolicy` object. Requests never merge configs on the hot path — `calculate_score` (§4.2) always receives an already-resolved, backend-specific config. Every `default_penalties.<dimension>` value, and its resolved counterpart, is a **list** of `PenaltyConfig` windows — the deep-merge for a single-window dimension merges dict-into-dict at index 0; `user`'s two windows are carried through unchanged since no backend overrides them today.
 
 ### 2.4 Tasks
 
@@ -199,10 +251,13 @@ backends:
 - [ ] Define all ABCs in `interfaces.py`.
 - [ ] Implement `config.py` with Pydantic models for backend policies.
 - [ ] Implement per-backend scoring config resolution (deep-merge `scoring.default_penalties`/`base_scores` with `scoring.overrides.<backend>`, once at startup — see §2.3 "Scoring config resolution").
-- [ ] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling.
-- [ ] Implement pass-through `main.py` that routes requests to the correct upstream.
+- [ ] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling and per-backend `httpx.Timeout(connect=connect_timeout_seconds, read=backend_timeout_seconds)` (§2.3, FR-053).
+- [ ] Stream request/response bodies between client and backend via `httpx.AsyncClient` streaming (no full in-memory buffering) — required for large archived resources such as video WARC records (FR-054).
+- [ ] Implement pass-through `main.py` that routes requests to the correct upstream using longest-prefix-wins matching on `match.path_prefix` (§4.1, FR-011a); return `404` for a request matching no configured backend (FR-011c).
 - [ ] Add `/healthz` and `/readyz` endpoints.
+- [ ] Implement trusted-proxy ingress middleware (`ingress` config, §2.3; FR-010a): reject `403` any request whose `REMOTE_ADDR` is not in `trusted_proxies`; otherwise resolve the client IP from `X-Forwarded-For` per `xff_trusted_hops`.
 - [ ] Write unit tests for config parsing.
+- [ ] Write unit tests for trusted-proxy IP resolution: an allowlisted peer with a valid XFF resolves the correct client IP; a non-allowlisted peer is rejected 403 regardless of XFF content.
 - [ ] Write unit tests for scoring config merge: a backend override touching only one dimension/field leaves all other dimensions and unlisted backends unchanged.
 - [ ] Validate that the app starts and proxies a real or mock backend.
 
@@ -219,17 +274,20 @@ class FixedController(CapacityController):
     def __init__(self, limit: int):
         self._limit = limit
         self._in_flight = 0
-        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition()
 
-    async def acquire(self, cost: int = 1) -> bool:
-        async with self._lock:
-            if self._in_flight + cost <= self._limit:
-                self._in_flight += cost
-                return True
-            return False
+    async def acquire(self, cost: int = 1) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._in_flight + cost <= self._limit)
+            self._in_flight += cost
 
-    def release(self, cost: int, **kwargs) -> None:
-        self._in_flight -= cost
+    async def release(self, cost: int, **kwargs) -> None:
+        async with self._condition:
+            self._in_flight -= cost
+            self._condition.notify_all()  # a slot just freed up; wake any waiter that now fits
+
+    def current_limit(self) -> int:
+        return self._limit
 ```
 
 ### 3.2 Priority Scheduler
@@ -254,10 +312,17 @@ class PriorityScheduler(Scheduler):
 
     async def run_worker(self, controller: CapacityController, dispatcher):
         while True:
+            # Wait for a slot BEFORE popping, so the item we take is whatever
+            # is currently highest-score — not whatever happened to be
+            # highest-score back when we started waiting. This is only safe
+            # to do generically because MVP cost is always 1 (A3): the worker
+            # doesn't need to know *which* request it's about to serve before
+            # it knows the request's cost.
+            await controller.acquire(1)
             _, _, ctx, future = await self._queue.get()
             if future.cancelled():
+                await controller.release(1, latency_ms=0, status_code=0, timed_out=False)
                 continue
-            await controller.acquire(ctx.cost)
             asyncio.create_task(dispatcher.dispatch(ctx, future, controller))
 ```
 
@@ -265,7 +330,8 @@ class PriorityScheduler(Scheduler):
 
 ```
 HTTP Request
-  → identify backend
+  → identify backend (longest-prefix match on path_prefix, §4.1, FR-011a;
+    no match → 404, FR-011c)
   → build RequestContext (score=100 default in phase 2)
   → enqueue in backend PriorityScheduler
   → await Future (with queue_timeout)
@@ -274,13 +340,14 @@ HTTP Request
 
 ### 3.4 Tasks
 
-- [ ] Implement `FixedController`.
-- [ ] Implement `PriorityScheduler` with worker coroutine.
+- [ ] Implement `FixedController` with blocking `acquire()` (`asyncio.Condition`, §3.1) — `acquire()` must never return without holding the slot; no boolean result for the caller to (mis)check.
+- [ ] Implement `PriorityScheduler` with worker coroutine that waits for a capacity slot *before* popping the next request (§3.2), so a fresher higher-score request can't be stuck behind a stale lower-score one that already claimed a slot and is blocked on it.
 - [ ] Wire request lifecycle in `main.py` middleware.
 - [ ] Implement queue timeout (asyncio.wait_for) and 503 response on timeout.
 - [ ] Implement 429 response on QueueFullError.
 - [ ] Unit tests: fixed controller admit/reject at boundary, queue timeout.
-- [ ] Load test: verify fixed concurrency limit is enforced under sustained traffic.
+- [ ] Unit tests: a request popped after already being cancelled releases its acquired slot back (§3.2) instead of leaking capacity.
+- [ ] Load test: verify fixed concurrency limit is enforced under sustained traffic, including under burst load — regression test for the original over-admission bug where a false/ignored `acquire()` result let dispatch proceed anyway.
 
 ---
 
@@ -294,15 +361,28 @@ Inputs extracted per request:
 
 | Field | Source |
 |---|---|
-| backend | Matched against each backend's `match.path_prefix` (pywb) or the TBD Solr routing convention (host/path/param) — see §2.3. Resolves to one of: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. |
+| backend | Matched against each backend's `match.path_prefix` (pywb) or the TBD Solr routing convention (host/path/param) — see §2.3. Matching is longest-prefix-wins (FR-011a); a path matching no configured backend resolves to a `404` response (FR-011c) rather than a backend value. Resolves to one of: `solr-page-search`, `solr-image-search`, `pywb-framed`, `pywb-noframe`, `pywb-patching`, `pywb-archivepagenow`. |
 | request_type | Derived from backend: search-page, search-image, replay-framed, replay-noframe, patching, archivepagenow |
 | user_class | Authorization header / session token verification |
-| source_ip | `X-Forwarded-For` or `REMOTE_ADDR` (trust only verified proxy headers) |
+| source_ip | Resolved by the trusted-proxy ingress check (`ingress` config, §2.3; FR-010a): the `X-Forwarded-For` entry `xff_trusted_hops` from the right, taken only when `REMOTE_ADDR` is in `trusted_proxies`. A request from an untrusted peer is rejected `403` before it ever reaches the classifier. |
 | subnet_24 | Computed from source_ip |
 | asn | GeoIP/ASN database lookup (local cache with TTL) |
 | country | GeoIP lookup (local cache with TTL) |
 | user_id | From verified auth token |
 | estimated_cost | From request type and backend cost model |
+
+### 4.1a UserClass Enum
+
+```python
+class UserClass(str, Enum):
+    ANONYMOUS = "anonymous"
+    RESEARCHER = "researcher"           # authenticated
+    SERVICE_ACCOUNT = "service_account"
+    INTERNAL = "internal"
+    UNKNOWN = "unknown"                 # verification failed or ambiguous
+```
+
+Identity-only: this reflects *who is asking*, resolved once during classification (`requirements.md` FR-012). It is **not** used to encode behavior — there is no `suspicious`/`bot` member. A client that behaves abusively is still one of the five classes above; its effective score drops through the per-IP/subnet/ASN/country/user penalties in §4.2, not through a separate identity guess that would double-count the same abuse signal (see `docs/decision_log.md` A4).
 
 ### 4.2 Scoring Formula
 
@@ -337,15 +417,18 @@ async def calculate_score(ctx: RequestContext, redis: Redis, config: ResolvedSco
 
 Each `*_penalty` function applies the soft/hard step function from its `PenaltyConfig` (window_seconds, soft/hard threshold, soft/hard penalty — see §4.4): below `soft_threshold` → 0; at/above `soft_threshold` and below `hard_threshold` → `soft_penalty`; at/above `hard_threshold` → `hard_penalty`.
 
+`config.penalties.<dimension>` is a **list** of `PenaltyConfig` windows (§2.3) — every dimension has at least one; `user` has two (a 60s burst window and a 3600s sustained window). Each `*_penalty` function evaluates every window in its list independently against its own Redis key (§4.3) and **sums** the resulting per-window penalties into the single value it returns to `calculate_score` above — consistent with how `calculate_score` itself sums penalties across dimensions. There is no quota or hard-cutoff path anywhere in this formula: every outcome, at any window, in any dimension, is a score adjustment, never a block.
+
 ### 4.3 Redis Key Schema
 
 ```
-rl:ip:{ip}:{backend}           TTL = 60s
-rl:net24:{prefix24}:{backend}  TTL = 60s
-rl:net6:{prefix6}:{backend}    TTL = 60s
-rl:asn:{asn}:{backend}         TTL = 60s
-rl:country:{cc}:{backend}      TTL = 300s
-rl:user:{uid}:{backend}        TTL = 3600s (daily quota)
+rl:ip:{ip}:{backend}                  TTL = 10s
+rl:net24:{prefix24}:{backend}         TTL = 60s
+rl:net6:{prefix6}:{backend}           TTL = 60s
+rl:asn:{asn}:{backend}                TTL = 60s
+rl:country:{cc}:{backend}             TTL = 300s
+rl:user:{uid}:{backend}:60            TTL = 60s    (burst window)
+rl:user:{uid}:{backend}:3600          TTL = 3600s  (sustained window — placeholder thresholds, §4.4)
 ```
 
 ### 4.4 Penalty Thresholds (Initial Values — tune with production data)
@@ -359,19 +442,24 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 | IPv6 /48 or /56 | 60s | 50 req | 200 req | -10 | -40 |
 | ASN | 60s | 200 req | 1000 req | -20 | -70 |
 | Country | 300s | 500 req | 2000 req | -5 | -30 |
-| Authenticated user | 60s | 50 req | 200 req | -5 | -40 |
+| Authenticated user — burst | 60s | 50 req | 200 req | -5 | -40 |
+| Authenticated user — sustained *(placeholder)* | 3600s | 500 req | 2000 req | -10 | -60 |
+
+`user` is the only dimension with more than one window (§4.2, A7 in `docs/decision_log.md`) — the burst and sustained rows above are both applied and summed, never chosen between.
 
 ### 4.5 Tasks
 
 - [ ] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
-- [ ] Integrate GeoIP/ASN lookup library with local TTL cache.
+- [ ] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the local database file at `geoip.db_path` (§2.3, FR-013a) with a local TTL cache; the running AAC process never fetches this file itself.
+- [ ] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads the latest MaxMind GeoLite2 database and writes it to `geoip.db_path`; the AAC only picks up a refreshed database on its next restart (FR-013a).
 - [ ] Implement `ScoreEngine` with Redis async counter increments.
-- [ ] Implement penalty functions per dimension, each taking its resolved `PenaltyConfig` (soft/hard threshold + penalty) rather than hardcoded constants.
+- [ ] Implement penalty functions per dimension, each taking its resolved list of `PenaltyConfig` windows (one or more per dimension — `user` has two, §2.3/§4.2) and summing the per-window soft/hard results, rather than hardcoded constants.
 - [ ] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
 - [ ] Log full score decomposition as structured JSON per request.
 - [ ] Unit tests: classification rules, penalty calculation, score clamping.
 - [ ] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
 - [ ] Unit tests: `solr-page-search`/`solr-image-search` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
+- [ ] Unit tests: the `user` dimension sums penalties across its 60s and 3600s windows independently (e.g. hard on the burst window + soft on the sustained window ⇒ both penalties applied).
 - [ ] Integration tests: verify score reflects correct Redis counter state.
 
 ---
@@ -399,6 +487,22 @@ class LatencyWindow:
         return sorted_samples[int(0.95 * len(sorted_samples))]
 ```
 
+Timeout rate and 5xx rate use the same rolling-window shape, over a boolean outcome instead of a continuous sample:
+
+```python
+class RateWindow:
+    def __init__(self, window_size: int = 100):
+        self._outcomes: deque[bool] = deque(maxlen=window_size)
+
+    def record(self, matched: bool) -> None:
+        self._outcomes.append(matched)
+
+    def rate(self) -> float:
+        if not self._outcomes:
+            return 0.0
+        return sum(self._outcomes) / len(self._outcomes)
+```
+
 ### 5.2 Adaptive Controller
 
 ```python
@@ -408,32 +512,55 @@ class AdaptiveController(CapacityController):
         self._min = config.min_concurrency
         self._max = config.max_concurrency
         self._target_p95 = config.target_p95_ms
+        self._timeout_rate_threshold = config.timeout_rate_threshold
+        self._error_rate_threshold = config.error_rate_threshold
         self._latency = LatencyWindow()
+        self._timeouts = RateWindow()
+        self._errors = RateWindow()
         self._cooldown_until: float = 0
+        self._in_flight = 0
+        self._condition = asyncio.Condition()
 
-    def release(self, cost, latency_ms, status_code, timed_out):
-        self._in_flight -= cost
-        if not timed_out and status_code < 500:
-            self._latency.record(latency_ms)
+    async def acquire(self, cost: int = 1) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._in_flight + cost <= self._limit)
+            self._in_flight += cost
+
+    async def release(self, cost, latency_ms, status_code, timed_out):
+        async with self._condition:
+            self._in_flight -= cost
+            self._timeouts.record(timed_out)
+            self._errors.record(status_code >= 500 and not timed_out)
+            if not timed_out and status_code < 500:
+                self._latency.record(latency_ms)
+            self._condition.notify_all()  # in_flight dropped; a waiter may now fit
+
+    def current_limit(self) -> int:
+        return self._limit
 
     async def _adjust_loop(self, interval: float = 30.0):
         while True:
             await asyncio.sleep(interval)
             if time.monotonic() < self._cooldown_until:
                 continue
-            self._adjust()
+            await self._adjust()
 
-    def _adjust(self):
+    async def _adjust(self):
         p95 = self._latency.p95()
         if p95 is None:
             return
 
         old_limit = self._limit
         target = self._target_p95
+        timeout_rate = self._timeouts.rate()
+        error_rate = self._errors.rate()
 
-        if self._timeout_rate > 0:
+        if timeout_rate > self._timeout_rate_threshold:
             self._limit = max(self._min, int(self._limit * 0.60))
             self._cooldown_until = time.monotonic() + 60
+        elif error_rate > self._error_rate_threshold:
+            self._limit = max(self._min, int(self._limit * 0.75))
+            self._cooldown_until = time.monotonic() + 30
         elif p95 > 2 * target:
             self._limit = max(self._min, int(self._limit * 0.70))
             self._cooldown_until = time.monotonic() + 30
@@ -445,16 +572,26 @@ class AdaptiveController(CapacityController):
         if self._limit != old_limit:
             log_limit_change(old_limit, self._limit, p95)
             metrics.adaptive_limit_changes_total.inc()
+            if self._limit > old_limit:
+                # Raising the limit must immediately unblock any acquire()
+                # already waiting — otherwise a queued request only benefits
+                # from the new limit on the next arrival, not the ones
+                # already blocked (see §5.3 tasks).
+                async with self._condition:
+                    self._condition.notify_all()
 ```
 
 ### 5.3 Tasks
 
 - [ ] Implement `LatencyWindow` with configurable sample size.
-- [ ] Implement `AdaptiveController` with adjustment loop.
+- [ ] Implement `AdaptiveController` with adjustment loop and blocking `acquire()` (`asyncio.Condition`, §5.2 — same pattern as `FixedController`, §3.1).
+- [ ] Wake blocked `acquire()` waiters whenever `_adjust()` raises `_limit` (§5.2) — an adaptive increase must be able to admit already-queued requests immediately, not just future ones.
 - [ ] Implement cooldown period logic.
-- [ ] Record timeout rate and 5xx rate as separate signals.
+- [ ] Implement `RateWindow` for timeout-rate and 5xx-rate tracking (§5.1); wire into `AdaptiveController.release()`/`_adjust()` (§5.2) — replaces the placeholder `self._timeout_rate` reference with an actual rolling-window computation, and adds the previously-unimplemented 5xx-rate cooldown branch from the adjustment table (`requirements.md` §6.5).
 - [ ] Log all limit change events with old/new limits and triggering p95.
 - [ ] Unit tests: adjustment table, cooldown, min/max bounds.
+- [ ] Unit tests: raising `_limit` at runtime unblocks an already-waiting `acquire()` immediately.
+- [ ] Unit tests: `_adjust()` triggers the timeout-rate and error-rate cooldown branches at their configured thresholds, independent of p95.
 - [ ] Simulation tests: feed synthetic latency curves; verify expected limit trajectory.
 
 ---
@@ -471,18 +608,22 @@ Register all metrics defined in `requirements.md §6.8` using `prometheus_client
 from prometheus_client import Counter, Gauge, Histogram
 
 inflight_requests   = Gauge("admission_inflight_requests", "...", ["backend"])
+inflight_tokens     = Gauge("admission_inflight_tokens", "...", ["backend"])
 concurrency_limit   = Gauge("admission_concurrency_limit", "...", ["backend"])
 queue_size          = Gauge("admission_queue_size", "...", ["backend"])
-admitted_total      = Counter("admission_admitted_total", "...", ["backend", "class"])
-rejected_total      = Counter("admission_rejected_total", "...", ["backend", "class", "reason"])
+requests_total      = Counter("admission_requests_total", "...", ["backend", "class", "exempt"])
+admitted_total      = Counter("admission_admitted_total", "...", ["backend", "class", "exempt"])
+rejected_total      = Counter("admission_rejected_total", "...", ["backend", "class", "reason", "exempt"])
 queue_timeout_total = Counter("admission_queue_timeout_total", "...", ["backend"])
 backend_latency     = Histogram("backend_request_duration_seconds", "...", ["backend", "class"])
 backend_errors      = Counter("backend_errors_total", "...", ["backend"])
 backend_timeouts    = Counter("backend_timeouts_total", "...", ["backend"])
 limit_changes       = Counter("adaptive_limit_changes_total", "...", ["backend"])
-score_distribution  = Histogram("score_distribution", "...", ["backend"], buckets=range(-100, 110, 10))
+score_distribution  = Histogram("score_distribution", "...", ["backend", "exempt"], buckets=range(-100, 110, 10))
 queue_wait          = Histogram("queue_wait_duration_seconds", "...", ["backend", "class"])
 ```
+
+`exempt` is `"true"`/`"false"`, reflecting `requirements.md` FR-022a's exempt-country list. Exempt-country traffic is still counted in these metrics' base totals — the label only adds a breakdown dimension for the §14 anomaly-review mitigation; it never excludes or redirects the count.
 
 ### 6.2 Structured Logging
 
@@ -516,9 +657,8 @@ Every admission decision emits one JSON log line:
 ### 6.3 Administrative API Tasks
 
 - [ ] Implement `GET /admin/backends` — list backends with current policy and live metrics snapshot.
-- [ ] Implement `GET/PUT /admin/backends/{name}/policy` — view/update backend policy at runtime.
+- [ ] Implement `GET /admin/backends/{name}/policy` — view active backend policy (GET-only for MVP; no runtime hot-reload — see FR-084, and `docs/decision_log.md` B3).
 - [ ] Implement `GET /admin/backends/{name}/limit` — current limit (fixed or adaptive).
-- [ ] Implement `POST /admin/backends/{name}/drain` — stop accepting new requests for a backend.
 - [ ] Enforce authentication on all `/admin/*` endpoints.
 
 ### 6.4 Tasks
@@ -539,12 +679,14 @@ Every admission decision emits one JSON log line:
 
 - [ ] Route real queries through `solr-page-search` and `solr-image-search` independently; verify each limit is enforced and metrics are reported per-backend.
 - [ ] Route real pywb requests through all four paths (`/wayback`, `/noFrame/replay`, `/noFrame/patching`, `/save`); verify each resolves to its own backend queue.
+- [ ] Verify longest-prefix-wins routing: a request path matching two configured prefixes (e.g. `/noFrame/patching` vs. a hypothetical bare `/noFrame`) resolves to the backend with the longer, more specific prefix (FR-011a).
+- [ ] Verify a request path matching no configured backend returns `404` without being enqueued or scored (FR-011c).
 - [ ] Simulate latency injection on `solr-page-search`; verify its adaptive controller reduces its limit without affecting `solr-image-search`.
 - [ ] Simulate backend 5xx burst; verify limit reduction and error metrics.
 - [ ] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter.
 - [ ] Simulate client disconnect during queue wait; verify Future cancellation.
 - [ ] Verify that saturating any one of the six backends does not affect the other five queues.
-- [ ] Verify that Redis disconnection triggers fallback and alerts.
+- [ ] Verify that Redis disconnection makes `/readyz` report not-ready (FR-083a) while admission continues to work normally — scoring fails open (base score only, zero penalties) and the fixed/adaptive capacity limiters keep protecting backends unaffected — and that an alert fires.
 
 ### 7.2 Load Testing
 
@@ -563,8 +705,9 @@ Scenarios:
 
 - [ ] Verify that client-supplied priority headers are ignored.
 - [ ] Verify that auth state is only derived from verified upstream headers.
+- [ ] Verify that a spoofed `X-Forwarded-For` from a peer not in `trusted_proxies` is rejected `403`, never trusted as the client IP (FR-010a).
 - [ ] Verify admin API requires authentication; returns 401 without credentials.
-- [ ] Verify that large request bodies and malformed headers are handled without crash.
+- [ ] Verify that large request bodies (e.g. a multi-GB WARC-backed resource) are streamed through without full in-memory buffering (FR-054) and that malformed headers are handled without crash. Maximum body/header size is enforced upstream by Apache httpd, not by the AAC — out of scope here (§4.2 Non-Goals, `requirements.md`).
 
 ---
 
@@ -582,12 +725,13 @@ Scenarios:
 6. Enable adaptive controller for `solr-page-search` and `solr-image-search` independently, each with conservative initial and min limits.
 7. Monitor p95 latency, limit evolution, queue depth, and rejection rate daily for 2 weeks.
 8. Tune thresholds and scoring penalties based on observed production data.
+9. Run `scripts/update_geoip_db.py` to refresh the local GeoIP/ASN database, then perform a rolling restart to pick it up (FR-013a) — establish this as a recurring operational step; the exact cadence/automation is outside the scope of this document.
 
 ### 8.2 Rollback Plan
 
 - Keep original direct Apache → backend routing as a fast fallback.
 - AAC can be bypassed by updating Apache httpd `ProxyPass` rules; no backend changes required.
-- All threshold and penalty configuration is in `config/backends.yaml`; changes take effect without restart if runtime reload is enabled.
+- All threshold and penalty configuration is in `config/backends.yaml`; changes require a process restart to take effect (FR-084 — no runtime hot-reload for MVP).
 
 ### 8.3 Initial Production Limits (Tentative — validate with load tests)
 
@@ -617,7 +761,7 @@ Scenarios:
 | Metrics | `prometheus_client` | Standard; required for Grafana/alerting integration. |
 | Logging | `structlog` or stdlib JSON formatter | Structured JSON logs per request. |
 | Config Validation | Pydantic v2 | Type-safe backend policy schema. |
-| GeoIP/ASN | `maxminddb` + MaxMind GeoLite2 | Free ASN and country data; local lookup. |
+| GeoIP/ASN | `maxminddb` + MaxMind GeoLite2 | Free ASN and country data; local-file-only lookup at `geoip.db_path` (§2.3) — the AAC never fetches it itself. `scripts/update_geoip_db.py` is the separate, standalone command that refreshes the file (FR-013a). |
 | Testing | `pytest` + `pytest-asyncio` + `httpx` test client | Async-native test suite. |
 | Load Testing | `locust` or `k6` | Scenario-based load generation. |
 

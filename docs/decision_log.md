@@ -1,65 +1,30 @@
-# AAC Docs — Revision Plan
+# AAC — Design Decision Log
 
 | Field | Value |
 |---|---|
-| Version | 0.1 (working) |
-| Status | In progress — reviewing `requirements.md` + `implementation_plan.md` |
+| Status | Historical record — all decisions below are final and already applied |
 | Owner | Ivo Branco |
-| Created | 2026-07-27 |
-| Targets | `docs/requirements.md`, `docs/implementation_plan.md` |
+| Companion docs | `docs/requirements.md`, `docs/implementation_plan.md` |
 
-## Purpose & how to use this doc
+## Purpose
 
-This is a **living checklist** of proposed revisions to the AAC requirements and
-implementation plan, produced from a review of both output docs against the two
-source docs (`docs/md/`). It exists so the analysis is not lost between working
-sessions — we expect to work through it over several days.
+This document records the design decisions behind the AAC requirements and
+implementation plan: the problem each one addressed, the options considered,
+and the final call. It exists so that anyone who later asks "why is it built
+this way?" doesn't have to reverse-engineer intent from the spec text alone.
 
-Each item is self-contained: it names the exact location(s), states the problem,
-and proposes a resolution, so you can act on it without re-reading the review.
+Every decision below is already reflected in `docs/requirements.md` and
+`docs/implementation_plan.md` — this is the rationale trail, not a place to
+track further changes. Open/unresolved items (placeholder values, undecided
+conventions) live in `docs/open_tbd.md`, not here.
 
-- **Part A** — design decisions that need a stakeholder call *before* editing.
-  Each has options + a recommendation and a `Decision:` line to fill in.
-- **Part B** — mechanical reconciliations (internal contradictions); safe to
-  apply once the Part A decisions they depend on are made.
-- **Part C** — new requirements to draft.
-- **Part D** — open TBDs to track (consolidated).
-
-Check items off (`- [x]`) as they land in the docs. Record outcomes in the
-**Progress log** at the bottom. Severity: **High** = will bite in implementation
-or is security-critical; **Medium** = real gap/inconsistency; **Low** = cleanup.
+- **Part A** — high-stakes design decisions that needed a stakeholder call.
+- **Part B** — mechanical reconciliations (internal contradictions in the docs).
+- **Part C** — new requirements drafted to close gaps found during review.
 
 ---
 
-## Summary table
-
-| # | Item | Severity | Part | Status |
-|---|---|---|---|---|
-| A1 | Trusted-proxy / `X-Forwarded-For` handling undefined | High | A | Open decision |
-| A2 | Scheduler worker over-admits (ignores `acquire()`) | High | A | Open decision |
-| A3 | Cost model referenced everywhere, never defined | High | A | Open decision |
-| A4 | Three conflicting user-class taxonomies | High | A | Open decision |
-| A5 | Redis-down fallback semantics self-defeating | Medium | A | Open decision |
-| A6 | `/readyz` may unready whole proxy on one backend down | Medium | A | Open decision |
-| A7 | Authenticated-user quota vs. penalty dropped | Medium | A | Open decision |
-| A8 | Behavioral scoring dangles (half-present) | Medium | A | Open decision |
-| B1 | IP counter TTL 60s contradicts 10s window | Medium | B | Ready |
-| B2 | Two Prometheus metrics defined but not registered | Medium | B | Ready |
-| B3 | Admin PUT/drain contradicts restart-only MVP | Medium | B | Needs A-input |
-| B4 | pywb-framed/noframe controller label mismatch | Low | B | Ready |
-| B5 | FR numbering gap (no FR-061) | Low | B | Ready |
-| C1 | No per-backend upstream/dispatch timeout | Medium | C | Ready |
-| C2 | No streaming / max body+header limits | Medium | C | Ready |
-| C3 | Adaptive error/timeout-rate sampling unstructured | Medium | C | Ready |
-| C4 | Unroutable path behavior undefined | Low | C | Ready |
-| C5 | Longest-prefix routing semantics unspecified | Low | C | Ready |
-| C6 | GeoIP/ASN DB refresh cadence unspecified | Low | C | Ready |
-| C7 | Exempt traffic not separately labelled in metrics | Low | C | Ready |
-| D  | Consolidated open TBDs | — | D | Tracking |
-
----
-
-## Part A — Design decisions (need stakeholder call before editing)
+## Part A — Design decisions
 
 ### A1 — Trusted-proxy / `X-Forwarded-For` handling is undefined (High)
 
@@ -88,7 +53,17 @@ authoritative header (simplest, least spoofable), with (a) as the AAC-side
 guard. Add a **Must** FR in §6.2 and a spoofing test in §7.3. Link to A6/A8
 (exemption safety depends on this).
 
-**Decision:** _pending_
+**Decision:** Hybrid of (a) with a hard reject (no silent fallback):
+- Trust `X-Forwarded-For` **only** when the direct TCP peer (`REMOTE_ADDR`) is
+  in a configured trusted-proxy allowlist (known Apache/Caddy front-end IPs).
+- If `REMOTE_ADDR` is **not** on the allowlist, reject the request with
+  **`403 Forbidden`** — do not fall back to treating `REMOTE_ADDR` as the
+  client IP. AAC must only ever be reached via a known front-end.
+- When trusted, the client IP is the **rightmost** XFF entry by default (the
+  hop immediately before the trusted proxy — safest against spoofing since
+  only trusted infra can append entries after it). Make the trusted-hop count
+  configurable (default `1`) so the web-server operator can override it if a
+  proxy chain (e.g. CDN + Apache) sits in front.
 
 ---
 
@@ -118,7 +93,10 @@ highest-score request, then dispatches. Update the §2.2 interface, §3.1
 `FixedController`, and §3.2 worker to match. Note the adaptive controller must
 release waiters when it raises its limit.
 
-**Decision:** _pending_
+**Decision:** (a) — blocking acquire. `CapacityController` exposes an
+awaitable "wait for slot" primitive; the worker blocks on it, then pops the
+highest-score request from the queue, then dispatches. The adaptive
+controller must wake waiters when it raises its limit at runtime.
 
 ---
 
@@ -148,7 +126,11 @@ the expensive backends), with the weighted model kept as a documented post-MVP
 lever. Either way, resolve the glossary vs. config mismatch and the
 Solr-only `request_cost_model` field (see B — tie-in).
 
-**Decision:** _pending_
+**Decision:** (a) — uniform cost = 1 for MVP. Backend protection comes
+entirely from fixed/adaptive concurrency limits, not per-request cost. The
+"ArchivePageNow = 10 tokens" glossary example becomes illustrative/future
+only; FR-046 is explicitly post-MVP. Drop the Solr-only `request_cost_model`
+field for MVP (uniform cost makes it a no-op) — see B6.
 
 ---
 
@@ -180,7 +162,17 @@ double-counts. The plan's comment "must match §4.2 UserClass enum" points at a
 the §6.3 table, and `base_scores`. This has a mechanical follow-through in Part B
 once the set is chosen.
 
-**Decision:** _pending_
+**Decision:** (a), with "suspicious"/"bot" kept as a **derived** concept, not
+a base-score input. `base_scores` becomes an identity-only enum: `anonymous`,
+`researcher`, `service_account`, `internal`, `unknown` (add base scores for
+`service_account` + `internal`, currently missing). There is no separate
+upfront "is this a bot" classification step. Instead, "bot"/"suspicious" is
+what the *existing* per-/24 subnet, per-ASN, and per-country penalties
+naturally produce: a client hammering from one subnet/ASN accumulates enough
+penalty that its effective score drops and it lands at the back of the queue
+— that demotion **is** the bot treatment. Pin the canonical `UserClass` enum
+(these 5 identity values) in a new §4.1a/§4.2, referenced from FR-012, the
+§6.3 table, and `base_scores`.
 
 ---
 
@@ -200,7 +192,16 @@ fails open (every request gets its base score, no penalties) while fixed/adaptiv
 concurrency limits continue to protect backends; alert immediately.** Drop or
 reframe "local counters." Update FR + §10 failure table + §14 risk mitigation.
 
-**Decision:** _pending_
+**Decision:** On Redis loss the AAC keeps serving — no "local counters"
+fallback (dropped entirely), no blocking, no crash. Scoring fails open: every
+request gets its base score, zero subnet/ASN/country/IP/user penalty, while
+the in-process fixed/adaptive concurrency limiters (Redis-independent)
+continue to protect backends exactly as before. The only externally visible
+change is `/readyz`, which flips to not-ready (per A6: config valid + Redis
+reachable) so whatever consumes it — the upstream blue/green branch HA switch,
+monitoring/alerting — can react; this is the alerting mechanism, not a
+request-blocking one. Update FR + §10 failure table + §14 risk mitigation to
+state this precisely; delete "local counters" wording.
 
 ---
 
@@ -219,7 +220,12 @@ separately (e.g. in `/admin/backends` and metrics) but do **not** gate process
 readiness on it; a down backend returns 503 for its own path only. Adjust FR-083
 + §6.9 wording + add a failure-mode row.
 
-**Decision:** _pending_
+**Decision:** Agreed as recommended — readiness = config valid + Redis
+reachable only; per-backend reachability is reported separately
+(`/admin/backends` + metrics) and never gates `/readyz`. Ties directly into
+A5: Redis reachability is the one dependency that *does* gate readiness, and
+losing it is meant to be visible externally via `/readyz` while the AAC keeps
+serving internally.
 
 ---
 
@@ -243,7 +249,29 @@ sources) is effectively absent from the output requirements.
 a stated design principle worth preserving as a post-MVP item). Fix the §4.3 TTL
 so it matches whichever window survives.
 
-**Decision:** _pending_
+**Decision:** Neither (a) nor (b) — there is no quota/hard-cutoff concept at
+all, for `user` or anything else. Instead, generalize to **multiple
+independent penalty windows per dimension**: a client can be penalised on a
+short window (60s, bursty abuse) *and* a long window (3600s, sustained
+low-and-slow abuse) at the same time.
+- Reshape `PenaltyConfig` so every dimension's `default_penalties.<dim>` entry
+  is a **list** of window configs (uniform shape everywhere, not a `user`-only
+  special case). `ip`/`net24`/`net6`/`asn`/`country` keep a single-element
+  list (unchanged behaviour); `user` gets two: the existing 60s entry plus a
+  new 3600s entry (thresholds/penalties TBD — tracked in `docs/open_tbd.md`).
+- Each window is tracked independently in Redis:
+  `rl:user:{id}:{backend}:{window_seconds}`, TTL = that window's
+  `window_seconds` (fixes the B1-style TTL/window mismatch for this key too).
+- `user_penalty()` evaluates every window's soft/hard step function
+  independently and **sums** them into one `penalty_user`, consistent with how
+  `calculate_score` already sums penalties across dimensions (§4.2) — no new
+  combination rule needed.
+- Net effect: crossing a threshold on any window never blocks the request —
+  it lowers effective score, so those requests sit further back in the
+  priority queue and are served only when spare backend capacity exists. This
+  queue-and-serve-if-capacity behaviour *is* the enforcement; delete "daily
+  quota" wording from `requirements.md:334` and
+  `implementation_plan.md:348` entirely.
 
 ---
 
@@ -262,20 +290,26 @@ it future), annotate the `rl:behavior` Redis row as reserved/post-MVP, and add a
 line to §12.2. Alternatively, promote it to a real FR — but that widens MVP
 scope, so deferring is recommended.
 
-**Decision:** _pending_
+**Decision:** Stronger than the recommendation — **remove entirely**, not
+defer. Delete "behavioral patterns" from the exec-summary scoring-dimensions
+sentence, delete the reserved `rl:behavior:{fingerprint}` row from the §4.3
+Redis schema, and delete any other mention in either doc. No reserved
+placeholder is carried forward; if behavioral scoring is wanted later it
+comes back as a fresh FR designed against the real system, not a half-defined
+carryover.
 
 ---
 
-## Part B — Mechanical reconciliations (apply once dependent A-items resolve)
+## Part B — Mechanical reconciliations
 
-### B1 — IP counter TTL contradicts the 10s window (Medium) — Ready
+### B1 — IP counter TTL contradicts the 10s window (Medium)
 - **Where:** `implementation_plan.md:343` says `rl:ip ... TTL = 60s`.
 - **Canonical:** `backends.yaml` `ip: {window_seconds: 10}`
   (`implementation_plan.md:104`) + penalty table `requirements.md:357` (10s) +
   FR-025 "TTL equal to the measurement window."
 - **Change:** §4.3 Redis schema → `rl:ip ... TTL = 10s`.
 
-### B2 — Two Prometheus metrics defined but never registered (Medium) — Ready
+### B2 — Two Prometheus metrics defined but never registered (Medium)
 - **Where:** `requirements.md` §6.8 lists 14 metrics; `implementation_plan.md`
   §6.1 (`:473-484`) registers 12.
 - **Missing:** `admission_inflight_tokens` (Gauge), `admission_requests_total`
@@ -283,43 +317,54 @@ scope, so deferring is recommended.
 - **Change:** add both to §6.1. Also reconcile the `reason` label the plan adds
   to `rejected_total` back into the §6.8 table.
 
-### B3 — Admin PUT/drain contradicts restart-only MVP (Medium) — Needs A-input
+### B3 — Admin PUT/drain contradicts restart-only MVP (Medium)
 - **Where:** plan §6.3 (`:518-522`) implements `PUT /admin/.../policy` + `POST
   /admin/.../drain`; requirements §6.9 (`:271-277`) is GET-only; FR-084
   (`:296`) = restart-only for MVP; §12.2 defers hot-reload; §8.2 (`:590`)
   hedges "without restart if runtime reload is enabled."
-- **Change:** move `PUT policy` to post-MVP; **decide** whether `drain` stays
-  (genuinely useful for the Phase-7 rollout — if kept, add it to §6.9 and note
-  it's operational, not config hot-reload). Remove the §8.2 hedge or align it
-  with FR-084.
+- **Decision:** `/admin` is **GET-only for MVP** — no hot-reload, no drain.
+  Remove `PUT /admin/.../policy` and `POST /admin/.../drain` from §6.3
+  entirely (both moved out of scope, not just post-MVP-flagged). Remove the
+  §8.2 "without restart if runtime reload is enabled" hedge so it aligns
+  cleanly with FR-084 (restart-only). If draining is wanted later, it comes
+  back as a fresh FR.
 
-### B4 — pywb-framed/noframe controller label mismatch (Low) — Ready
+### B4 — pywb-framed/noframe controller label mismatch (Low)
 - **Where:** §6.7 labels them "Adaptive" (`requirements.md:235-236`); config has
   `controller: fixed` (`implementation_plan.md:164-171`); §8.3 says "Fixed →
   Adaptive" (`:598-599`).
 - **Change:** §6.7 "Controller" column → "Fixed → Adaptive" to match canonical
   config.
 
-### B5 — FR numbering gap (Low) — Ready
+### B5 — FR numbering gap (Low)
 - **Where:** §6.7 jumps FR-060 → FR-062 (no FR-061).
 - **Change:** renumber or intentionally note the gap.
 
-### B6 — `request_cost_model` field consistency (Low) — depends on A3
+### B6 — `request_cost_model` field consistency (Low)
 - **Where:** Solr backends carry `request_cost_model: default`; pywb entries
   omit it.
-- **Change:** per A3 outcome — either drop the field entirely (uniform cost) or
-  add it uniformly with a defined meaning.
+- **Change:** per A3 (uniform cost = 1 for MVP), drop the `request_cost_model`
+  field entirely from `backends.yaml` for MVP — it's a no-op under uniform
+  cost. Revisit if/when weighted cost is picked up post-MVP.
 
 ---
 
-## Part C — New requirements to draft
+## Part C — New requirements rationale
 
 ### C1 — Per-backend upstream/dispatch timeout (Medium)
 Schema has `queue_timeout_seconds` but no *backend* timeout, yet FR-052 detects
 timeouts and the adaptive controller keys off timeout rate. Add
 `backend_timeout_seconds` (+ connect timeout) per backend in §2.3. ArchivePageNow
 (live capture) needs a much longer upstream timeout than Solr — this is also why
-its real value is a TBD (see D).
+its real value is a TBD (see `docs/open_tbd.md`).
+
+**Decision:** Add per-backend `connect_timeout_seconds`/`backend_timeout_seconds`
+(new FR-053) to `config/backends.yaml` §2.3, distinct from `queue_timeout_seconds`
+(which only bounds queue wait, not backend response wait). Placeholder defaults:
+5s connect / 60s response for all backends except `pywb-archivepagenow` at 10s
+connect / 120s response, since it performs a live capture rather than serving
+from the existing archive. Values are explicitly flagged not-yet-validated
+(see `docs/open_tbd.md`).
 
 ### C2 — Streaming + max body/header limits (Medium)
 A replay proxy serves large archived resources; buffering full responses is a
@@ -327,52 +372,75 @@ memory risk. The EN source called for max body/header limits. Add an FR:
 stream request/response bodies; enforce max header size and max request body
 size (configurable). Tech stack already picks `httpx` streaming.
 
+**Decision:** Streaming only — Ivo explicitly rejected adding a max body/header
+size limit inside the AAC; that enforcement is delegated entirely to the
+front-end web server (Apache httpd today, Caddy in the future) and is out of
+scope here (new `requirements.md` §4.2 Non-Goals bullet). Kept as its own new
+FR-054: stream request/response bodies via `httpx.AsyncClient` (no full
+in-memory buffering) — a distinct concern from a size *limit*, needed for large
+archived resources such as video WARC records.
+
 ### C3 — Adaptive error/timeout-rate sampling structure (Medium)
 Only latency has a `LatencyWindow` (`implementation_plan.md:388-399`);
 `self._timeout_rate` / 5xx rate in `_adjust` (`:434`) are referenced but never
 computed. Sketch their rolling-window computation (counts over the adjust
 interval) in Phase 4.
 
+**Decision:** Mechanical fix, no design ambiguity. Add a `RateWindow` class
+(deque of bools + `.rate()`) mirroring `LatencyWindow`, fixing a genuine latent
+bug: `AdaptiveController._adjust()` referenced `self._timeout_rate`, which was
+never initialized or updated anywhere. Also adds the previously-missing 5xx-rate
+(`error_rate`) cooldown branch to `_adjust()` — `requirements.md`'s adjustment
+table (§6.5) already listed a "Backend 5xx rate exceeds threshold" row that was
+never implemented in code. New `timeout_rate_threshold`/`error_rate_threshold`
+config fields (placeholder 0.05/0.10) added to the two adaptive (Solr) backend
+blocks only — meaningless for `FixedController`. No new FR needed; already
+covered by existing FR-041.
+
 ### C4 — Unroutable path behavior (Low)
 Requests matching no backend have no defined behavior. Specify default-deny /
 404 (relevant since Apache may forward only known paths, but should be explicit).
+
+**Decision:** Mechanical — return HTTP `404 Not Found` for any request path
+matching no configured backend, without enqueueing or scoring it (new
+FR-011c).
 
 ### C5 — Longest-prefix routing semantics (Low)
 `/noFrame/replay` and `/noFrame/patching` share a prefix. Specify longest-prefix
 (not first-segment) matching so they resolve to distinct backends.
 
+**Decision:** Mechanical — matching is longest-prefix-wins: among all
+configured backends, the path resolves to whichever backend's `path_prefix` is
+the longest match, so a more specific prefix takes precedence over a shorter
+one that also matches (FR-011a, amended in place — no new FR needed).
+
 ### C6 — GeoIP/ASN DB refresh cadence (Low)
 Tech stack picks MaxMind GeoLite2; FR-013 requires global accuracy. A stale DB
 means wrong ASN/country. Add an operational note/FR for periodic DB refresh.
+
+**Decision:** Ivo's exact design, preserved precisely (new FR-013a): the AAC
+reads a **local** GeoIP/ASN database file only; it **never** downloads this
+file itself, neither at startup nor at any restart — that would create a
+runtime dependency on an external service's availability. A separate, explicit
+standalone command (`scripts/update_geoip_db.py`) exists purely to
+download/refresh the local `.mmdb` file. The AAC only picks up a refreshed
+database on its **next restart** (a rolling restart is how the new DB gets
+picked up). The actual cadence/deployment-process integration of running the
+download command is explicitly out of scope for these docs (a
+deployment-process detail — noted in `requirements.md` §11 and
+`implementation_plan.md` §8.1).
 
 ### C7 — Exempt traffic metric label (Low)
 §14 risk mitigation claims exempt traffic is "metered separately" for anomaly
 review, but only the log carries `country_exempt`; metrics don't. Add an
 `exempt` label (or a dedicated counter) so the anomaly-review claim is real.
 
----
-
-## Part D — Consolidated open TBDs to track
-
-Carried from the docs + surfaced by this review. Keep this list authoritative.
-
-- [ ] **Solr routing convention** — how `solr-page-search` vs `solr-image-search`
-  is distinguished (host / path prefix / query param). Blocks FR-011b (Must) and
-  the two `match.path_prefix: null` entries. *(pre-existing)*
-- [ ] **Real production concurrency numbers** for all 6 backends — current values
-  are first-draft placeholders. *(pre-existing)*
-- [ ] **Real pywb upstream ports** — 8080–8083 are placeholders. *(pre-existing)*
-- [ ] **IPv6 prefix length** — /48 vs /56 (FR-022 leaves it open;
-  `requirements.md:157`). Materially affects abuse aggregation.
-- [ ] **Cost-model token values** — only needed if A3 chooses weighted cost.
-- [ ] **Per-backend backend/upstream timeout values** — especially ArchivePageNow
-  (see C1).
-
----
-
-## Progress log
-
-- **2026-07-27** — Revision plan created from review of `requirements.md` +
-  `implementation_plan.md` against the two source docs. 8 design decisions (A),
-  5 mechanical reconciliations (B), 7 new-requirement drafts (C), 6 tracked TBDs
-  (D). Nothing applied to the docs yet — all items Open.
+**Decision:** Add an `exempt` label (`true`/`false`) to 4 existing Prometheus
+metrics (`admission_requests_total`, `admission_admitted_total`,
+`admission_rejected_total`, `score_distribution`), reflecting FR-022a's
+exempt-country list. Per Ivo's explicit clarification: exempt-country traffic
+must still be **counted within the existing aggregate totals** — the label is
+an additional breakdown dimension on top of the totals, not a redirect into a
+separate metric. This is what makes the §14 "metered separately... for
+anomaly review" mitigation real. No new FR needed — references existing
+FR-022a.
