@@ -21,6 +21,9 @@ conventions) live in `docs/open_tbd.md`, not here.
 - **Part A** — high-stakes design decisions that needed a stakeholder call.
 - **Part B** — mechanical reconciliations (internal contradictions in the docs).
 - **Part C** — new requirements drafted to close gaps found during review.
+- **Part D** — new requirements adopted after comparing the AAC's design
+  against Anubis (`~/projects/arquivo/anubis`), a Go-based anti-scraper
+  reverse proxy, for inspiration.
 
 ---
 
@@ -347,6 +350,17 @@ carryover.
   field entirely from `backends.yaml` for MVP — it's a no-op under uniform
   cost. Revisit if/when weighted cost is picked up post-MVP.
 
+### B7 — "Queue full" failure mode contradicted its own status code (Low)
+- **Where:** §10 Failure Modes table said "Queue full → reject with controlled
+  503 response," while FR-003 ("429 (queue full / rate exceeded) or 503
+  (backend unavailable)"), FR-033, and `implementation_plan.md` §3.4
+  ("Implement 429 response on QueueFullError") all agree queue-full rejection
+  is 429, not 503.
+- **Change:** §10 row corrected to 429, and split into two rows while fixing
+  it — one for FR-033's hard length cap, one for the new FR-033a predictive
+  rejection (Part D, D1) — since both now share the same "reject before
+  enqueueing" shape but trigger on different conditions.
+
 ---
 
 ## Part C — New requirements rationale
@@ -444,3 +458,102 @@ an additional breakdown dimension on top of the totals, not a redirect into a
 separate metric. This is what makes the §14 "metered separately... for
 anomaly review" mitigation real. No new FR needed — references existing
 FR-022a.
+
+---
+
+## Part D — New requirements from comparing against Anubis
+
+Anubis (`~/projects/arquivo/anubis`) is a Go-based anti-scraper reverse proxy:
+a different problem (challenge/deny suspicious clients) from the AAC's
+(prioritize contention, never block outright), but its request-scoring and
+observability machinery is close enough to be worth a side-by-side read. Most
+of what it does doesn't transfer — its PoW challenges, JWT cookies, CEL
+expression rules, and commercial ASN/GeoIP reputation service all cut against
+decisions already made for the AAC (no blocking, no runtime-authored rules,
+no remote reputation lookups; see A5, A8, C6). Three ideas did transfer,
+below.
+
+### D1 — Predictive queue-wait rejection (Medium)
+
+**Where:** FR-033 (`requirements.md`, max queue length) and FR-034 (queue
+timeout, default 300s) only bound the queue by a raw count or expire a
+request late, after it has already waited the full timeout.
+
+**Problem:** A request can be accepted under `queue_max_size` (FR-033) while
+the queue is nowhere near full, yet — given its position and the backend's
+current effective service rate — have no realistic chance of being dispatched
+before `queue_timeout_seconds` (FR-034) elapses anyway. It ties up a queue
+slot and a client connection for the full timeout window only to receive the
+same rejection it could have received immediately. Anubis's threshold model
+triggers its action (allow/challenge/deny) the moment accumulated weight
+crosses a line, rather than waiting out a fixed clock; the AAC's queue
+equivalent is estimating drain time instead of only counting queue length.
+
+**Decision:** Add FR-033a: before enqueueing, estimate the projected wait for
+a new arrival from current queue depth and current effective service rate
+(current concurrency limit and observed *average* — not p95 — service
+latency). If the projection already exceeds the backend's `queue_timeout_seconds`,
+reject immediately with `429` (reason `queue_wait_exceeded`), without
+enqueueing. Confirmed with Ivo that the comparison basis is the **queue
+timeout** (FR-034) — the wait-time budget — not the backend dispatch timeout
+(FR-053), which bounds a different phase of the request's life (post-dispatch
+backend response time, not pre-dispatch queue wait). While reconciling this
+against §10 Failure Modes, found and fixed an existing inconsistency where the
+"Queue full" row said 503 though FR-003/FR-033/the implementation plan all
+already say 429 (see B7).
+
+Implementation follow-through (`implementation_plan.md`): this needs mean
+service latency for **every** backend, not just adaptive ones — currently
+only `AdaptiveController` tracks latency (`LatencyWindow`, Phase 4 §5.1).
+`LatencyWindow` moves earlier (Phase 2 §3.1) and gains a `.mean()` method
+alongside its existing `.p95()`; `FixedController.release()` now also feeds
+it. Below the existing 10-sample minimum (matching `LatencyWindow.p95()`'s
+own gate), there's no trustworthy estimate yet — the check fails open (don't
+reject) rather than guessing, consistent with how the rest of the system
+treats insufficient data (e.g. A5's Redis-down fail-open).
+
+### D2 — Opt-in diagnostic response headers (Low)
+
+**Where:** FR-026 already requires the full score decomposition in structured
+logs; nothing surfaces any of it on the response itself.
+
+**Problem:** Diagnosing a specific request's admission/rejection today means
+correlating a client-side observation (browser, curl, load-test tool) against
+a structured log line by timestamp/IP — workable, but slower than reading
+the answer directly off the response. Anubis takes this approach with its
+`X-Anubis-Rule`/`X-Anubis-Action`/`X-Anubis-Status` response headers.
+
+**Decision:** Add FR-074: an opt-in `observability.debug_headers.enabled`
+config flag (default `false`) that, when set, attaches four headers to every
+response: `X-AAC-Backend`, `X-AAC-Score` (final clamped score), `X-AAC-Exempt`,
+and `X-AAC-Reject-Reason` (rejected requests only). Deliberately scoped down
+from Anubis's pattern and from the AAC's own full per-dimension log
+breakdown — four fields, not the whole `ScoreBreakdown` — since headers go
+out over the wire to the requester and a full breakdown would hand a client
+exactly the tuning signal needed to probe penalty thresholds. Default
+`false` because this does disclose scoring internals to whoever is making the
+request; Ivo confirmed he wants it available for both debugging *and*
+production use, so it's a config toggle rather than a debug-build-only
+feature, but it isn't on by default.
+
+### D3 — Penalty-store abstraction scoped to a single production implementation (Low)
+
+**Where:** `implementation_plan.md` §4 ("Implement `ScoreEngine` with Redis
+async counter increments") couples the scoring engine directly to Redis, with
+no interface between them.
+
+**Problem:** Anubis abstracts its challenge/nonce state behind a `store`
+interface with four pluggable backends (memory/bbolt/s3api/valkey) so
+single-instance deployments don't need a real store running. Worth asking
+whether the AAC should do the same for its Redis-backed penalty counters.
+
+**Decision:** No — explicitly rejected multi-backend store support. Ivo's
+call: introduce the abstraction in code (a `PenaltyStore` interface) purely
+so `ScoreEngine` isn't wired directly to a Redis client, but ship exactly one
+production implementation, `RedisPenaltyStore` — Redis remains a hard
+requirement (FR-024 unchanged). An in-memory fake may exist under `tests/`
+for unit tests, but it is not a supported deployment configuration and never
+appears in `config/backends.yaml` or any environment-variable wiring. This
+gets the testability benefit (swap the fake in for unit tests) without
+taking on the maintenance cost of multiple real storage backends that Anubis
+carries.

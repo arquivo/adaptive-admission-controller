@@ -191,6 +191,7 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 | FR-031 | Within each queue, requests shall be ordered by score descending, then by arrival timestamp ascending (FIFO within same score). | Must |
 | FR-032 | The system shall support weighted fair scheduling to prevent indefinite starvation of lower-score traffic. | Should |
 | FR-033 | The system shall enforce a configurable maximum queue length per backend. Requests that cannot be enqueued shall receive immediate rejection. | Must |
+| FR-033a | Before enqueuing a request, the system shall estimate the projected wait time for that request based on the backend's current queue depth and current effective service rate (derived from the current concurrency limit and observed average — not p95 — service latency). If the estimated wait already exceeds the backend's configured queue timeout (FR-034), the system shall immediately reject the request with `429`, without enqueueing it. This is a distinct, earlier-triggering check from FR-033: a queue can be well under its configured maximum length and still be projected to take longer than the queue timeout to drain, given the backend's current throughput. | Must |
 | FR-034 | The system shall enforce a configurable queue timeout per backend (default: 300 seconds). Requests that exceed this wait shall receive a controlled error response. | Must |
 | FR-035 | The system shall NOT use request ageing as a primary anti-starvation mechanism. A low-score request should not gain the same priority as a high-score request merely by waiting. | Must |
 
@@ -205,7 +206,7 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 | FR-044 | The adaptive controller shall enforce minimum and maximum concurrency bounds per backend. | Must |
 | FR-045 | The adaptive controller shall enter a cooldown period after large decreases to prevent rapid oscillation. | Must |
 | FR-046 | **Post-MVP.** The system shall support configurable request cost units so that expensive request types consume multiple tokens. MVP uses a uniform cost of 1 for every request type (see Weighted Cost, §2 Glossary). | Could |
-| FR-047 | All capacity controller types shall implement a common interface (acquire, release, current_limit). | Must |
+| FR-047 | All capacity controller types shall implement a common interface (acquire, release, current_limit, mean_latency_ms). `mean_latency_ms` feeds FR-033a's projected queue-wait estimate and is required from fixed controllers, not only adaptive ones. | Must |
 
 **Adaptive controller adjustment table:**
 
@@ -267,6 +268,7 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 | FR-071 | The system shall emit structured JSON logs for admission, rejection, score decomposition, and adaptive limit changes. | Must |
 | FR-072 | The system shall expose a `/metrics` endpoint in Prometheus text format. | Must |
 | FR-073 | The system shall expose `/healthz` and `/readyz` endpoints. | Must |
+| FR-074 | When enabled via configuration (`observability.debug_headers.enabled`, default `false`), the system shall attach diagnostic response headers to every request: `X-AAC-Backend` (matched backend name), `X-AAC-Score` (final clamped score), `X-AAC-Exempt` (`true`/`false`), and `X-AAC-Reject-Reason` (present only on a rejected request, mirroring the `reason` label on `admission_rejected_total`). This is a lightweight diagnostic aid, not a replacement for the full score decomposition already required in structured logs (FR-026) — headers stay to these four fields rather than exposing the full per-dimension penalty breakdown. Because this discloses scoring signals directly to the client, it defaults to disabled and should be enabled deliberately. | Should |
 
 **Required Prometheus metrics:**
 
@@ -287,7 +289,7 @@ A client accumulating enough penalty ends up clamped near `score_clamp.min` (FR-
 | `score_distribution` | Histogram | Distribution of request scores by backend. |
 | `queue_wait_duration_seconds` | Histogram | Time requests spend waiting in queue. |
 
-`admission_rejected_total` additionally carries a `reason` label (e.g. `queue_full`, `capacity_full`, `backend_unavailable`) distinguishing why a request was rejected.
+`admission_rejected_total` additionally carries a `reason` label (e.g. `queue_full`, `queue_wait_exceeded`, `capacity_full`, `backend_unavailable`) distinguishing why a request was rejected. `queue_wait_exceeded` corresponds to FR-033a's predictive rejection, distinct from `queue_full` (FR-033's hard length cap).
 
 `admission_requests_total`, `admission_admitted_total`, `admission_rejected_total`, and `score_distribution` additionally carry an `exempt` label (`true`/`false`) reflecting whether the request's source country is in the configured exempt-country list (FR-022a). Exempt-country traffic is still counted in these metrics' existing totals — the label adds a breakdown dimension, it does not exclude or redirect the count — which is what makes the §14 "metered separately... for anomaly review" mitigation real.
 
@@ -310,7 +312,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 
 | Category | Contains | Source | Precedence |
 |---|---|---|---|
-| **Policy configuration** | Backend registry, path routing, concurrency limits/bounds, queue limits, scoring weights, penalty thresholds, exempt-country list | A single YAML file (`config/backends.yaml`), version-controlled | Compiled-in Pydantic defaults < YAML file. No environment-variable overrides of individual policy fields — this avoids two disagreeing sources of truth for the same value. |
+| **Policy configuration** | Backend registry, path routing, concurrency limits/bounds, queue limits, scoring weights, penalty thresholds, exempt-country list, diagnostic-header toggle (FR-074) | A single YAML file (`config/backends.yaml`), version-controlled | Compiled-in Pydantic defaults < YAML file. No environment-variable overrides of individual policy fields — this avoids two disagreeing sources of truth for the same value. |
 | **Secrets & deployment wiring** | Redis connection URL/credentials, admin API auth token, log level, HTTP listen port, path to the policy YAML file itself | Environment variables only | Never written to the YAML file or committed to version control. |
 
 | ID | Requirement | Priority |
@@ -343,7 +345,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 | Reliability | Controller must fail predictably. | Bounded queues, timeouts, and controlled rejection before collapse. |
 | Scalability | System should support horizontal scaling. | Redis for global state; each replica receives a fraction of backend budget without shared state, or uses Redis token coordination. |
 | Operability | Clear metrics and logs required for operations. | Per-backend, per-class Prometheus metrics. Structured JSON logs. |
-| Maintainability | Backend policy logic must be pluggable. | Common interfaces for capacity controllers and schedulers. |
+| Maintainability | Backend policy logic must be pluggable. | Common interfaces for capacity controllers and schedulers. Penalty counters are accessed through an internal store interface, not a direct Redis dependency scattered through the codebase; Redis remains the sole supported production implementation (no multi-backend store support planned — see `docs/decision_log.md` D3). |
 | Security | Auth state and priority metadata must come from verified sources only. | Use verified auth headers or upstream authentication; never trust client-supplied priority claims. |
 | Fairness | Lower-priority traffic must not be starved indefinitely. | Configure queue timeouts; optionally add weighted fair scheduling. |
 
@@ -364,6 +366,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - Redis local to a single server is insufficient for distributed abuse mitigation.
 - Redis access must be asynchronous (`redis.asyncio`).
 - Counters for `rl:net24`, `rl:net6`, `rl:asn`, and `rl:country` shall still be incremented for requests from exempt countries (for observability and tuning), but their values shall not be subtracted from the request score.
+- The scoring engine shall access these counters through an internal store abstraction rather than calling Redis directly; Redis is the only supported production implementation of that abstraction (see `docs/decision_log.md` D3).
 
 ---
 
@@ -374,13 +377,14 @@ The AAC has two distinct categories of configuration, sourced differently:
 3. User class, auth status, IP, subnet, ASN, and country extracted.
 4. Request cost estimated from request type.
 5. Penalty counters read from Redis; score calculated and clamped.
-6. Request placed in the backend's priority queue.
-7. Scheduler selects the highest-score request when capacity is available.
-8. Capacity controller grants tokens or keeps request queued.
-9. Dispatcher forwards request to backend over pooled async HTTP connection.
-10. Response latency, status code, and timeout status recorded.
-11. Capacity tokens released; adaptive controller receives the sample.
-12. Adaptive controller updates limit on its next scheduled interval.
+6. Estimated queue wait computed from current queue depth and current effective service rate; if it already exceeds the queue timeout, the request is rejected immediately with `429` (FR-033a) without being enqueued.
+7. Request placed in the backend's priority queue.
+8. Scheduler selects the highest-score request when capacity is available.
+9. Capacity controller grants tokens or keeps request queued.
+10. Dispatcher forwards request to backend over pooled async HTTP connection.
+11. Response latency, status code, and timeout status recorded.
+12. Capacity tokens released; adaptive controller receives the sample.
+13. Adaptive controller updates limit on its next scheduled interval.
 
 ---
 
@@ -390,7 +394,8 @@ The AAC has two distinct categories of configuration, sourced differently:
 |---|---|---|
 | Backend timeout | Record timeout; release tokens; reduce adaptive limit if applicable. | Must |
 | Backend 5xx burst | Record errors; reduce adaptive limit if configured. | Must |
-| Queue full | Reject with controlled 503 response. | Must |
+| Queue full | Reject immediately with `429` (FR-033), without enqueueing. | Must |
+| Queue backlog projected to exceed timeout | Reject immediately with `429` (FR-033a), without enqueueing, even though the queue is under its configured maximum length. | Must |
 | Controller overload | Apply admission rejection before internal process collapse. | Must |
 | Configuration error | Fail `/readyz`; avoid accepting traffic under invalid configuration. | Must |
 | Redis unavailable | Scoring fails open (base score only, zero penalties); fixed/adaptive concurrency limits keep protecting backends unchanged; `/readyz` reports not-ready (FR-083a); alert immediately. | Must |
@@ -420,6 +425,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - Simple adaptive concurrency controller (p95-based) for the Search APIs and pywb.
 - Priority queue per backend with score ordering and FIFO tie-breaking.
 - Bounded queues and queue timeout (default 300s).
+- Predictive queue-wait rejection (FR-033a): reject immediately with `429` when the projected wait to drain the current backlog already exceeds the queue timeout, even if the queue is under its configured maximum length.
 - Prometheus metrics per backend and per class.
 - Structured JSON logs: admission, rejection, score decomposition, adaptive limit changes.
 - `/healthz`, `/readyz`, `/metrics` endpoints.

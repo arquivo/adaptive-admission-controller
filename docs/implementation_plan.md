@@ -73,6 +73,7 @@ class CapacityController(ABC):
     async def acquire(self, cost: int = 1) -> None: ...
     async def release(self, cost: int, latency_ms: float, status_code: int, timed_out: bool) -> None: ...
     def current_limit(self) -> int: ...
+    def mean_latency_ms(self) -> float | None: ...  # feeds FR-033a's projected-wait estimate (§3.2); None until enough samples exist
 
 class Scheduler(ABC):
     async def enqueue(self, request_context: RequestContext) -> asyncio.Future: ...
@@ -81,6 +82,13 @@ class Scheduler(ABC):
 class BackendPolicy(ABC):
     def classify(self, request: Request) -> RequestContext: ...
     def estimate_cost(self, ctx: RequestContext) -> int: ...
+
+class PenaltyStore(ABC):
+    # Isolates ScoreEngine from Redis specifically (docs/decision_log.md D3).
+    # RedisPenaltyStore (§4.5) is the sole production implementation; a
+    # test-only in-memory fake may exist under tests/ but is never a
+    # supported deployment configuration.
+    async def increment_and_get(self, key: str, ttl_seconds: int) -> int: ...
 ```
 
 ### 2.3 Configuration Schema (Pydantic)
@@ -112,6 +120,13 @@ geoip:
   # rolling restart); integrating that command into deployment automation
   # is out of scope here (§8.1).
   db_path: /var/lib/aac/GeoLite2-City.mmdb   # placeholder — set to the real deployment path
+
+observability:
+  debug_headers:
+    # Attaches X-AAC-Backend/Score/Exempt/Reject-Reason to every response
+    # (FR-074). Discloses scoring internals to the client — off by default;
+    # enable deliberately per environment. See docs/decision_log.md D2.
+    enabled: false
 
 scoring:
   exempt_countries: ["PT"]   # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
@@ -250,7 +265,7 @@ backends:
 ### 2.4 Tasks
 
 - [ ] Initialise Python project (`pyproject.toml`, virtual environment, linting).
-- [ ] Define all ABCs in `interfaces.py`.
+- [ ] Define all ABCs in `interfaces.py`, including `PenaltyStore` (§2.2) — `ScoreEngine` (Phase 3, §4.5) must depend only on this interface, never on a Redis client directly.
 - [ ] Implement `config.py` with Pydantic models for backend policies.
 - [ ] Implement per-backend scoring config resolution (deep-merge `scoring.default_penalties`/`base_scores` with `scoring.overrides.<backend>`, once at startup — see §2.3 "Scoring config resolution").
 - [ ] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling and per-backend `httpx.Timeout(connect=connect_timeout_seconds, read=backend_timeout_seconds)` (§2.3, FR-053).
@@ -271,25 +286,56 @@ backends:
 
 ### 3.1 Fixed Capacity Controller
 
+`LatencyWindow` is defined here, not in Phase 4, because FR-033a's predictive
+queue-wait rejection (§3.2) needs a mean service-time estimate for **every**
+backend, fixed or adaptive — not just the adaptive ones. Phase 4 (§5.1)
+reuses this same class unchanged and adds `RateWindow` alongside it for
+timeout/error-rate tracking.
+
 ```python
+class LatencyWindow:
+    def __init__(self, window_size: int = 100):
+        self._samples: deque[float] = deque(maxlen=window_size)
+
+    def record(self, latency_ms: float) -> None:
+        self._samples.append(latency_ms)
+
+    def mean(self) -> float | None:
+        if len(self._samples) < 10:
+            return None
+        return sum(self._samples) / len(self._samples)
+
+    def p95(self) -> float | None:
+        if len(self._samples) < 10:
+            return None
+        sorted_samples = sorted(self._samples)
+        return sorted_samples[int(0.95 * len(sorted_samples))]
+
+
 class FixedController(CapacityController):
     def __init__(self, limit: int):
         self._limit = limit
         self._in_flight = 0
         self._condition = asyncio.Condition()
+        self._latency = LatencyWindow()
 
     async def acquire(self, cost: int = 1) -> None:
         async with self._condition:
             await self._condition.wait_for(lambda: self._in_flight + cost <= self._limit)
             self._in_flight += cost
 
-    async def release(self, cost: int, **kwargs) -> None:
+    async def release(self, cost: int, latency_ms: float, status_code: int, timed_out: bool) -> None:
         async with self._condition:
             self._in_flight -= cost
+            if not timed_out and status_code < 500:
+                self._latency.record(latency_ms)
             self._condition.notify_all()  # a slot just freed up; wake any waiter that now fits
 
     def current_limit(self) -> int:
         return self._limit
+
+    def mean_latency_ms(self) -> float | None:
+        return self._latency.mean()
 ```
 
 ### 3.2 Priority Scheduler
@@ -298,18 +344,37 @@ class FixedController(CapacityController):
 # PriorityQueue entry: (-score, timestamp, request_context, future)
 # Negative score so that highest score is returned first by heapq.
 
+def estimate_wait_seconds(queue_depth: int, concurrency_limit: int, mean_latency_ms: float | None) -> float:
+    # Little's-law-style approximation: `concurrency_limit` requests served
+    # in parallel, each taking ~mean_latency_ms on average, drain
+    # `queue_depth` queued items ahead of a new arrival at an effective rate
+    # of concurrency_limit / mean_latency_ms per ms (FR-033a).
+    if mean_latency_ms is None or concurrency_limit <= 0:
+        return 0.0  # not enough samples yet (cold start) — fail open, don't reject
+    return (queue_depth * mean_latency_ms) / concurrency_limit / 1000.0
+
+
 class PriorityScheduler(Scheduler):
-    def __init__(self, queue_max_size: int, queue_timeout: float):
+    def __init__(self, queue_max_size: int, queue_timeout: float, controller: CapacityController):
         self._queue = asyncio.PriorityQueue(maxsize=queue_max_size)
         self._timeout = queue_timeout
+        self._controller = controller  # source of current_limit()/mean_latency_ms() for FR-033a
 
     async def enqueue(self, ctx: RequestContext) -> asyncio.Future:
+        projected_wait = estimate_wait_seconds(
+            queue_depth=self._queue.qsize(),
+            concurrency_limit=self._controller.current_limit(),
+            mean_latency_ms=self._controller.mean_latency_ms(),
+        )
+        if projected_wait > self._timeout:
+            raise QueueWaitExceededError()  # FR-033a — 429, reason=queue_wait_exceeded
+
         future = asyncio.get_running_loop().create_future()
         entry = (-ctx.score, ctx.arrival_time, ctx, future)
         try:
             self._queue.put_nowait(entry)
         except asyncio.QueueFull:
-            raise QueueFullError()
+            raise QueueFullError()  # FR-033 — 429, reason=queue_full
         return future
 
     async def run_worker(self, controller: CapacityController, dispatcher):
@@ -335,7 +400,8 @@ HTTP Request
   → identify backend (longest-prefix match on path_prefix, §4.1, FR-011a;
     no match → 404, FR-011c)
   → build RequestContext (score=100 default in phase 2)
-  → enqueue in backend PriorityScheduler
+  → estimate projected queue wait (§3.2, FR-033a); exceeds queue_timeout → 429
+  → enqueue in backend PriorityScheduler; queue full → 429 (FR-033)
   → await Future (with queue_timeout)
   → return response or 503/429
 ```
@@ -343,12 +409,15 @@ HTTP Request
 ### 3.4 Tasks
 
 - [ ] Implement `FixedController` with blocking `acquire()` (`asyncio.Condition`, §3.1) — `acquire()` must never return without holding the slot; no boolean result for the caller to (mis)check.
+- [ ] Implement `LatencyWindow` (§3.1) and feed it from `FixedController.release()` — needed for FR-033a's projected-wait estimate on fixed backends, not just adaptive ones.
 - [ ] Implement `PriorityScheduler` with worker coroutine that waits for a capacity slot *before* popping the next request (§3.2), so a fresher higher-score request can't be stuck behind a stale lower-score one that already claimed a slot and is blocked on it.
+- [ ] Implement `estimate_wait_seconds()` and the FR-033a check in `PriorityScheduler.enqueue()` (§3.2): reject with `429`/`queue_wait_exceeded` when the projection already exceeds `queue_timeout_seconds`, without touching the queue; fails open (never rejects) when fewer than 10 latency samples exist yet.
 - [ ] Wire request lifecycle in `main.py` middleware.
 - [ ] Implement queue timeout (asyncio.wait_for) and 503 response on timeout.
-- [ ] Implement 429 response on QueueFullError.
+- [ ] Implement 429 response on `QueueFullError` (FR-033, reason `queue_full`) and on `QueueWaitExceededError` (FR-033a, reason `queue_wait_exceeded`) — distinct reasons, same status code.
 - [ ] Unit tests: fixed controller admit/reject at boundary, queue timeout.
 - [ ] Unit tests: a request popped after already being cancelled releases its acquired slot back (§3.2) instead of leaking capacity.
+- [ ] Unit tests: `estimate_wait_seconds()` — below the 10-sample minimum returns `0.0` (never rejects); at/above it, a queue depth × mean latency that exceeds `queue_timeout_seconds` raises `QueueWaitExceededError` before the queue is anywhere near `queue_max_size`.
 - [ ] Load test: verify fixed concurrency limit is enforced under sustained traffic, including under burst load — regression test for the original over-admission bug where a false/ignored `acquire()` result let dispatch proceed anyway.
 
 ---
@@ -388,19 +457,19 @@ Identity-only: this reflects *who is asking*, resolved once during classificatio
 
 ### 4.2 Scoring Formula
 
-`config` below is the backend's already-resolved `ResolvedScoringConfig` (see §2.3 "Scoring config resolution") — `base_scores`, `exempt_countries`, and per-dimension penalty thresholds have already had any `scoring.overrides.<backend>` entries merged in before this function is ever called.
+`config` below is the backend's already-resolved `ResolvedScoringConfig` (see §2.3 "Scoring config resolution") — `base_scores`, `exempt_countries`, and per-dimension penalty thresholds have already had any `scoring.overrides.<backend>` entries merged in before this function is ever called. `store` is a `PenaltyStore` (§2.2) — `calculate_score` and the `*_penalty` helpers below depend only on that interface, never on a Redis client directly; `RedisPenaltyStore` (§4.5) is the only production implementation (`docs/decision_log.md` D3).
 
 ```python
-async def calculate_score(ctx: RequestContext, redis: Redis, config: ResolvedScoringConfig) -> int:
+async def calculate_score(ctx: RequestContext, store: PenaltyStore, config: ResolvedScoringConfig) -> int:
     base = config.base_scores[ctx.user_class]
     is_exempt = ctx.country in config.exempt_countries
 
     penalty = 0
-    penalty_ip = await ip_penalty(ctx.source_ip, ctx.backend, redis, config.penalties.ip)
-    penalty_net24 = await net24_penalty(ctx.subnet_24, ctx.backend, redis, config.penalties.net24)
-    penalty_asn = await asn_penalty(ctx.asn, ctx.backend, redis, config.penalties.asn)
-    penalty_country = await country_penalty(ctx.country, ctx.backend, redis, config.penalties.country)
-    penalty_user = await user_penalty(ctx.user_id, ctx.backend, redis, config.penalties.user)
+    penalty_ip = await ip_penalty(ctx.source_ip, ctx.backend, store, config.penalties.ip)
+    penalty_net24 = await net24_penalty(ctx.subnet_24, ctx.backend, store, config.penalties.net24)
+    penalty_asn = await asn_penalty(ctx.asn, ctx.backend, store, config.penalties.asn)
+    penalty_country = await country_penalty(ctx.country, ctx.backend, store, config.penalties.country)
+    penalty_user = await user_penalty(ctx.user_id, ctx.backend, store, config.penalties.user)
 
     penalty += penalty_ip
     penalty += penalty_user
@@ -454,7 +523,8 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 - [ ] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
 - [ ] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the local database file at `geoip.db_path` (§2.3, FR-013a) with a local TTL cache; the running AAC process never fetches this file itself.
 - [ ] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads the latest MaxMind GeoLite2 database and writes it to `geoip.db_path`; the AAC only picks up a refreshed database on its next restart (FR-013a).
-- [ ] Implement `ScoreEngine` with Redis async counter increments.
+- [ ] Implement `ScoreEngine` against the `PenaltyStore` interface (§2.2) — never a direct Redis client — backed by `RedisPenaltyStore` (async `INCR`+`EXPIRE`), the sole production implementation (`docs/decision_log.md` D3).
+- [ ] (tests only) Implement an in-memory `FakePenaltyStore` for unit tests — not a supported deployment configuration; never referenced from `config/backends.yaml` or environment-variable wiring.
 - [ ] Implement penalty functions per dimension, each taking its resolved list of `PenaltyConfig` windows (one or more per dimension — `user` has two, §2.3/§4.2) and summing the per-window soft/hard results, rather than hardcoded constants.
 - [ ] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
 - [ ] Log full score decomposition as structured JSON per request.
@@ -472,22 +542,10 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 
 ### 5.1 Latency Sampling
 
-Every `release()` call feeds a rolling latency window:
-
-```python
-class LatencyWindow:
-    def __init__(self, window_size: int = 100):
-        self._samples: deque[float] = deque(maxlen=window_size)
-
-    def record(self, latency_ms: float) -> None:
-        self._samples.append(latency_ms)
-
-    def p95(self) -> float | None:
-        if len(self._samples) < 10:
-            return None
-        sorted_samples = sorted(self._samples)
-        return sorted_samples[int(0.95 * len(sorted_samples))]
-```
+`LatencyWindow` (mean + p95) was already introduced in Phase 2 §3.1 — moved
+there because FR-033a's projected-wait estimate needs it for fixed backends
+too, not only adaptive ones. `AdaptiveController` below reuses it unchanged
+for its `p95()` reads.
 
 Timeout rate and 5xx rate use the same rolling-window shape, over a boolean outcome instead of a continuous sample:
 
@@ -540,6 +598,9 @@ class AdaptiveController(CapacityController):
     def current_limit(self) -> int:
         return self._limit
 
+    def mean_latency_ms(self) -> float | None:
+        return self._latency.mean()  # feeds FR-033a's projected-wait estimate, same as FixedController
+
     async def _adjust_loop(self, interval: float = 30.0):
         while True:
             await asyncio.sleep(interval)
@@ -585,8 +646,7 @@ class AdaptiveController(CapacityController):
 
 ### 5.3 Tasks
 
-- [ ] Implement `LatencyWindow` with configurable sample size.
-- [ ] Implement `AdaptiveController` with adjustment loop and blocking `acquire()` (`asyncio.Condition`, §5.2 — same pattern as `FixedController`, §3.1).
+- [ ] Implement `AdaptiveController` with adjustment loop and blocking `acquire()` (`asyncio.Condition`, §5.2 — same pattern as `FixedController`, §3.1); reuses the `LatencyWindow` already implemented in Phase 2 §3.1, no new implementation needed.
 - [ ] Wake blocked `acquire()` waiters whenever `_adjust()` raises `_limit` (§5.2) — an adaptive increase must be able to admit already-queued requests immediately, not just future ones.
 - [ ] Implement cooldown period logic.
 - [ ] Implement `RateWindow` for timeout-rate and 5xx-rate tracking (§5.1); wire into `AdaptiveController.release()`/`_adjust()` (§5.2) — replaces the placeholder `self._timeout_rate` reference with an actual rolling-window computation, and adds the previously-unimplemented 5xx-rate cooldown branch from the adjustment table (`requirements.md` §6.5).
@@ -656,6 +716,19 @@ Every admission decision emits one JSON log line:
 }
 ```
 
+### 6.2a Diagnostic Response Headers (opt-in, FR-074)
+
+When `observability.debug_headers.enabled` is `true` (default `false`, §2.3), the response middleware attaches four headers to every response:
+
+```
+X-AAC-Backend: page-search-api
+X-AAC-Score: 90
+X-AAC-Exempt: true
+X-AAC-Reject-Reason: queue_wait_exceeded   # present only when the request was rejected
+```
+
+These mirror a subset of the fields already logged per request (§6.2) — a lightweight pointer for interactive debugging (`curl -i`, browser devtools) against a live environment, not a replacement for the full per-dimension score breakdown, which stays log-only (`docs/decision_log.md` D2).
+
 ### 6.3 Administrative API Tasks
 
 - [ ] Implement `GET /admin/backends` — list backends with current policy and live metrics snapshot.
@@ -669,6 +742,8 @@ Every admission decision emits one JSON log line:
 - [ ] Emit structured JSON log per request (admission, rejection, timeout, limit change).
 - [ ] Expose `/metrics` endpoint.
 - [ ] Implement admin API endpoints.
+- [ ] Implement opt-in diagnostic response headers (`X-AAC-Backend`, `X-AAC-Score`, `X-AAC-Exempt`, `X-AAC-Reject-Reason`) gated by `observability.debug_headers.enabled` (default `false`, §6.2a, FR-074).
+- [ ] Unit tests: headers absent by default; present with correct values when enabled, including `X-AAC-Reject-Reason` on a rejected request and its absence on an admitted one.
 - [ ] Write integration test: verify expected metrics are emitted under load.
 
 ---
@@ -686,6 +761,7 @@ Every admission decision emits one JSON log line:
 - [ ] Simulate latency injection on `page-search-api`; verify its adaptive controller reduces its limit without affecting `image-search-api`.
 - [ ] Simulate backend 5xx burst; verify limit reduction and error metrics.
 - [ ] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter.
+- [ ] Simulate a backlog large enough that the projected wait already exceeds `queue_timeout_seconds` while the queue is still under `queue_max_size`; verify immediate `429` with reason `queue_wait_exceeded` (FR-033a), distinct from the `queue_full` case above `queue_max_size`.
 - [ ] Simulate client disconnect during queue wait; verify Future cancellation.
 - [ ] Verify that saturating any one of the six backends does not affect the other five queues.
 - [ ] Verify that Redis disconnection makes `/readyz` report not-ready (FR-083a) while admission continues to work normally — scoring fails open (base score only, zero penalties) and the fixed/adaptive capacity limiters keep protecting backends unaffected — and that an alert fires.
@@ -709,6 +785,7 @@ Scenarios:
 - [ ] Verify that auth state is only derived from verified upstream headers.
 - [ ] Verify that a spoofed `X-Forwarded-For` from a peer not in `trusted_proxies` is rejected `403`, never trusted as the client IP (FR-010a).
 - [ ] Verify admin API requires authentication; returns 401 without credentials.
+- [ ] Verify diagnostic response headers (§6.2a, FR-074) are absent when `observability.debug_headers.enabled` is left at its default (`false`); enabling it exposes exactly the four documented headers, nothing more.
 - [ ] Verify that large request bodies (e.g. a multi-GB WARC-backed resource) are streamed through without full in-memory buffering (FR-054) and that malformed headers are handled without crash. Maximum body/header size is enforced upstream by Apache httpd, not by the AAC — out of scope here (§4.2 Non-Goals, `requirements.md`).
 
 ---
@@ -758,7 +835,7 @@ Scenarios:
 | HTTP Framework | FastAPI | Native async, clean middleware, Pydantic integration. |
 | ASGI Server | Uvicorn | Low overhead; async I/O native. |
 | Backend HTTP Client | `httpx` async | Async, connection pooling, streaming support. |
-| Global State | Redis (shared, async) | Required for distributed abuse signal aggregation. |
+| Global State | Redis (shared, async), behind a `PenaltyStore` interface | Required for distributed abuse signal aggregation. The interface exists for testability (a fake store in unit tests, §4.5); Redis is the only supported production implementation — no other backing store is planned (`docs/decision_log.md` D3). |
 | Local Cache | TTL dict or `cachetools` | ASN/GeoIP lookups; non-critical. |
 | Metrics | `prometheus_client` | Standard; required for Grafana/alerting integration. |
 | Logging | `structlog` or stdlib JSON formatter | Structured JSON logs per request. |
