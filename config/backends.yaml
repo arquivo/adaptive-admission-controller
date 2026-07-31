@@ -1,0 +1,148 @@
+# AAC example backend policy configuration.
+#
+# This file is the canonical reference for default concurrency/queue values
+# (docs/implementation_plan.md §2.3). Values marked "placeholder" below are
+# tracked in docs/open_tbd.md and are installation-dependent — they must be
+# overridden per environment rather than resolved once here.
+
+ingress:
+  # Peers (REMOTE_ADDR) allowed to set X-Forwarded-For — the front-end
+  # Apache/Caddy IP(s). A request from any other peer is rejected 403
+  # before classification/scoring ever runs (FR-010a).
+  trusted_proxies: ["127.0.0.1", "::1"] # default: localhost (IPv4 + IPv6) for a
+    # co-located front-end; installation-dependent — set to the real front-end
+    # IP(s)/CIDRs when Apache/Caddy runs on a separate host
+  # Client IP = the X-Forwarded-For entry this many hops from the right.
+  # Default 1 (rightmost = the hop immediately before the trusted proxy).
+  xff_trusted_hops: 1
+
+geoip:
+  # Local MaxMind GeoLite2 file the AAC reads at startup for ASN/country
+  # lookups (FR-013, FR-013a). Placeholder path — see docs/open_tbd.md.
+  db_path: /var/lib/aac/GeoLite2-City.mmdb
+
+observability:
+  debug_headers:
+    # Attaches X-AAC-Backend/Score/Exempt/Reject-Reason to every response
+    # (FR-074). Off by default — see docs/decision_log.md D2.
+    enabled: false
+
+scoring:
+  exempt_countries: ["PT"] # skip subnet/24, IPv6-prefix, ASN, and country penalties for these
+  ipv6_prefix_length: 56 # /48 or /56 — bucket size for IPv6 abuse aggregation (FR-022)
+
+  base_scores: # per user_class — identity-only enum, see requirements.md §4.1a
+    anonymous: 100
+    researcher: 80
+    service_account: 90
+    internal: 100
+    unknown: 50
+
+  score_clamp: { min: -100, max: 100 }
+
+  # Global default penalty thresholds. Each dimension is a LIST of one or
+  # more independent windows. Below soft_threshold: no penalty. Between
+  # soft/hard: soft_penalty applies. At/above hard_threshold: hard_penalty
+  # applies. Per-window penalties for the same dimension are summed.
+  default_penalties:
+    ip: [{ window_seconds: 10, soft_threshold: 10, hard_threshold: 30, soft_penalty: 10, hard_penalty: 40 }]
+    net24: [{ window_seconds: 60, soft_threshold: 50, hard_threshold: 200, soft_penalty: 10, hard_penalty: 40 }]
+    net6: [{ window_seconds: 60, soft_threshold: 50, hard_threshold: 200, soft_penalty: 10, hard_penalty: 40 }]
+    asn: [{ window_seconds: 60, soft_threshold: 200, hard_threshold: 1000, soft_penalty: 20, hard_penalty: 70 }]
+    country: [{ window_seconds: 300, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 5, hard_penalty: 30 }]
+    user:
+      - { window_seconds: 60, soft_threshold: 50, hard_threshold: 200, soft_penalty: 5, hard_penalty: 40 }
+      - { window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60 } # best-guess default — tune with production data
+
+  # Per-backend overrides: deep-merge over default_penalties/base_scores above.
+  # Only list the fields/dimensions a backend needs to diverge on.
+  overrides:
+    page-search-api:
+      penalties:
+        ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
+    image-search-api:
+      penalties:
+        ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
+
+backends:
+  # --- Search APIs (2 independent services, separate hardware/collections;
+  # each talks to its own SolrCloud cluster internally) ---
+  - name: page-search-api
+    upstream_url: http://page-search-api:8080 # environment-specific — see docs/open_tbd.md
+    match:
+      path_prefix: /textsearch
+    controller: adaptive
+    min_concurrency: 20
+    initial_concurrency: 100
+    max_concurrency: 500
+    target_p95_ms: 100
+    timeout_rate_threshold: 0.05 # best-guess default — tune with production data
+    error_rate_threshold: 0.10 # best-guess default — tune with production data
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
+    queue_max_size: 5000
+    queue_timeout_seconds: 300
+
+  - name: image-search-api
+    upstream_url: http://image-search-api:8080 # environment-specific — see docs/open_tbd.md
+    match:
+      path_prefix: /imagesearch
+    controller: adaptive
+    min_concurrency: 20
+    initial_concurrency: 100
+    max_concurrency: 500
+    target_p95_ms: 100
+    timeout_rate_threshold: 0.05 # best-guess default, see page-search-api above
+    error_rate_threshold: 0.10 # best-guess default, see page-search-api above
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
+    queue_max_size: 5000
+    queue_timeout_seconds: 300
+
+  # --- pywb (4 independent uwsgi processes, own port each) ---
+  - name: pywb-framed
+    upstream_url: http://pywb-framed:8080
+    match:
+      path_prefix: /wayback
+    controller: fixed
+    concurrency_limit: 100
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
+    queue_max_size: 2000
+    queue_timeout_seconds: 300
+
+  - name: pywb-noframe
+    upstream_url: http://pywb-noframe:8081
+    match:
+      path_prefix: /noFrame/replay
+    controller: fixed
+    concurrency_limit: 100
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
+    queue_max_size: 2000
+    queue_timeout_seconds: 300
+
+  - name: pywb-patching
+    upstream_url: http://pywb-patching:8082
+    match:
+      path_prefix: /noFrame/patching
+    controller: fixed
+    concurrency_limit: 10
+    connect_timeout_seconds: 5
+    backend_timeout_seconds: 60
+    queue_max_size: 100
+    queue_timeout_seconds: 300
+
+  - name: pywb-archivepagenow
+    upstream_url: http://pywb-archivepagenow:8083
+    match:
+      path_prefix: /save
+    controller: fixed
+    concurrency_limit: 5
+    # Longer than the other five backends: ArchivePageNow performs a live
+    # capture of the target page rather than serving from the existing
+    # archive, so it is expected to take substantially longer per request.
+    connect_timeout_seconds: 10
+    backend_timeout_seconds: 120
+    queue_max_size: 50
+    queue_timeout_seconds: 300
