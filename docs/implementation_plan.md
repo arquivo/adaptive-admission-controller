@@ -23,7 +23,7 @@
 
 | Phase | Deliverable | Validation Gate |
 |---|---|---|
-| 1 — Foundation | Project skeleton, interfaces, config model | Tests pass; app starts and proxies a single backend |
+| 1 — Foundation ✅ | Project skeleton, interfaces, config model | Tests pass; app starts and proxies a single backend |
 | 2 — Fixed Admission | Fixed capacity controller + priority queue per backend | Load test shows fixed concurrency enforced correctly |
 | 3 — Scoring Engine | Request classifier + Redis-based scoring | Score decomposition visible in logs; penalties applied |
 | 4 — Adaptive Controller | p95-based adaptive concurrency for Search APIs/pywb | Simulated latency curves drive correct limit changes |
@@ -264,19 +264,23 @@ backends:
 
 ### 2.4 Tasks
 
-- [ ] Initialise Python project (`pyproject.toml`, virtual environment, linting).
-- [ ] Define all ABCs in `interfaces.py`, including `PenaltyStore` (§2.2) — `ScoreEngine` (Phase 3, §4.5) must depend only on this interface, never on a Redis client directly.
-- [ ] Implement `config.py` with Pydantic models for backend policies.
-- [ ] Implement per-backend scoring config resolution (deep-merge `scoring.default_penalties`/`base_scores` with `scoring.overrides.<backend>`, once at startup — see §2.3 "Scoring config resolution").
-- [ ] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling and per-backend `httpx.Timeout(connect=connect_timeout_seconds, read=backend_timeout_seconds)` (§2.3, FR-053).
-- [ ] Stream request/response bodies between client and backend via `httpx.AsyncClient` streaming (no full in-memory buffering) — required for large archived resources such as video WARC records (FR-054).
-- [ ] Implement pass-through `main.py` that routes requests to the correct upstream using longest-prefix-wins matching on `match.path_prefix` (§4.1, FR-011a); return `404` for a request matching no configured backend (FR-011c).
-- [ ] Add `/healthz` and `/readyz` endpoints.
-- [ ] Implement trusted-proxy ingress middleware (`ingress` config, §2.3; FR-010a): reject `403` any request whose `REMOTE_ADDR` is not in `trusted_proxies`; otherwise resolve the client IP from `X-Forwarded-For` per `xff_trusted_hops`.
-- [ ] Write unit tests for config parsing.
-- [ ] Write unit tests for trusted-proxy IP resolution: an allowlisted peer with a valid XFF resolves the correct client IP; a non-allowlisted peer is rejected 403 regardless of XFF content.
-- [ ] Write unit tests for scoring config merge: a backend override touching only one dimension/field leaves all other dimensions and unlisted backends unchanged.
-- [ ] Validate that the app starts and proxies a real or mock backend.
+**Status: complete (2026-07-31).** Implemented with `uv` + `pyproject.toml` per the approved plan (`/home/ibranco/.claude/plans/soft-mixing-moonbeam.md`). 54 unit + integration tests passing; full `docker compose up` smoke test verified `/healthz`/`/readyz` (incl. Redis down), all-6-prefix routing, 404/403, and non-zero exit on broken YAML.
+
+- [x] Initialise Python project (`pyproject.toml`, virtual environment, linting).
+- [x] Define all ABCs in `interfaces.py`, including `PenaltyStore` (§2.2) — `ScoreEngine` (Phase 3, §4.5) must depend only on this interface, never on a Redis client directly.
+- [x] Implement `config.py` with Pydantic models for backend policies.
+- [x] Implement per-backend scoring config resolution (deep-merge `scoring.default_penalties`/`base_scores` with `scoring.overrides.<backend>`, once at startup — see §2.3 "Scoring config resolution").
+- [x] Implement `dispatcher.py` using `httpx.AsyncClient` with connection pooling and per-backend `httpx.Timeout(connect=connect_timeout_seconds, read=backend_timeout_seconds)` (§2.3, FR-053).
+- [x] Stream request/response bodies between client and backend via `httpx.AsyncClient` streaming (no full in-memory buffering) — required for large archived resources such as video WARC records (FR-054).
+- [x] Implement pass-through `main.py` that routes requests to the correct upstream using longest-prefix-wins matching on `match.path_prefix` (§4.1, FR-011a); return `404` for a request matching no configured backend (FR-011c).
+- [x] Add `/healthz` and `/readyz` endpoints.
+- [x] Implement trusted-proxy ingress middleware (`ingress` config, §2.3; FR-010a): reject `403` any request whose `REMOTE_ADDR` is not in `trusted_proxies`; otherwise resolve the client IP from `X-Forwarded-For` per `xff_trusted_hops`.
+- [x] Write unit tests for config parsing.
+- [x] Write unit tests for trusted-proxy IP resolution: an allowlisted peer with a valid XFF resolves the correct client IP; a non-allowlisted peer is rejected 403 regardless of XFF content.
+- [x] Write unit tests for scoring config merge: a backend override touching only one dimension/field leaves all other dimensions and unlisted backends unchanged.
+- [x] Validate that the app starts and proxies a real or mock backend.
+- [x] (not in original plan — added after the `docker compose` smoke test surfaced a bare unhandled 500) `dispatcher.py` returns `502 {"detail": "bad gateway"}` when the backend connection fails, instead of propagating the raw `httpx` error.
+- [x] (not in original plan) `Dockerfile` + `docker-compose.yml` (uv multi-stage build; AAC + Redis only — real backend containers are Phase 6).
 
 ---
 
