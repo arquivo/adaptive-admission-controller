@@ -22,7 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.auth import JWTVerifier
-from app.capacity import FixedController
+from app.capacity import AdaptiveController, FixedController
 from app.config import AACConfig, Settings, load_config, resolve_scoring_config
 from app.dispatcher import BackendDispatcher
 from app.errors import QueueFullError, QueueWaitExceededError
@@ -76,17 +76,11 @@ def _build_lifespan(preloaded_config: AACConfig | None):
         app.state.schedulers = {}
         worker_tasks = [asyncio.create_task(app.state.auth.refresh_loop())]
         for backend in config.backends:
-            # Phase 2 only implements the fixed controller. `adaptive`
-            # backends get a temporary non-adapting FixedController sized at
-            # initial_concurrency, so the queue/capacity pipeline is uniform
-            # across all backends (FR-047) — Phase 4 replaces this stand-in
-            # with real adaptive concurrency adjustment.
-            limit = (
-                backend.concurrency_limit
-                if backend.controller == "fixed"
-                else backend.initial_concurrency
-            )
-            controller = FixedController(limit)
+            if backend.controller == "fixed":
+                controller = FixedController(backend.concurrency_limit)
+            else:
+                controller = AdaptiveController(backend)
+                worker_tasks.append(asyncio.create_task(controller.adjust_loop()))
             scheduler = PriorityScheduler(
                 backend.queue_max_size, backend.queue_timeout_seconds, controller
             )

@@ -4,7 +4,7 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 3 ("Request Classification and Scoring Engine") complete
+## Status: Phase 4 ("Adaptive Concurrency Controller") complete
 
 The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
@@ -17,8 +17,13 @@ Phase 3 wires in real request classification and Redis-backed scoring: every req
 classified by source IP/subnet, GeoIP country/ASN, and (optionally) a verified Keycloak JWT, then
 scored against per-backend penalty thresholds so the priority queue actually reorders requests
 meaningfully instead of only ever seeing ties. A verified JWT only ever raises a request's
-priority — the AAC never gates access on authentication. Adaptive concurrency and full
-observability (metrics, admin API, diagnostic headers) land in later phases.
+priority — the AAC never gates access on authentication. Phase 4 replaces the fixed-limit
+stand-in for `controller: adaptive` backends with a real p95-based adaptive controller: a
+background loop periodically shrinks or grows each backend's concurrency limit from its rolling
+p95 latency, timeout rate, and 5xx rate, relative to a configured target and thresholds — an
+overloaded backend gets throttled automatically, and a healthy one is allowed to grow back
+towards its configured maximum. Full observability (metrics, admin API, diagnostic headers) lands
+in Phase 5.
 
 ## Backends
 

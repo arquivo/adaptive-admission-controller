@@ -658,15 +658,15 @@ class AdaptiveController(CapacityController):
 
 ### 5.3 Tasks
 
-- [ ] Implement `AdaptiveController` with adjustment loop and blocking `acquire()` (`asyncio.Condition`, §5.2 — same pattern as `FixedController`, §3.1); reuses the `LatencyWindow` already implemented in Phase 2 §3.1, no new implementation needed.
-- [ ] Wake blocked `acquire()` waiters whenever `_adjust()` raises `_limit` (§5.2) — an adaptive increase must be able to admit already-queued requests immediately, not just future ones.
-- [ ] Implement cooldown period logic.
-- [ ] Implement `RateWindow` for timeout-rate and 5xx-rate tracking (§5.1); wire into `AdaptiveController.release()`/`_adjust()` (§5.2) — replaces the placeholder `self._timeout_rate` reference with an actual rolling-window computation, and adds the previously-unimplemented 5xx-rate cooldown branch from the adjustment table (`requirements.md` §6.5).
-- [ ] Log all limit change events with old/new limits and triggering p95.
-- [ ] Unit tests: adjustment table, cooldown, min/max bounds.
-- [ ] Unit tests: raising `_limit` at runtime unblocks an already-waiting `acquire()` immediately.
-- [ ] Unit tests: `_adjust()` triggers the timeout-rate and error-rate cooldown branches at their configured thresholds, independent of p95.
-- [ ] Simulation tests: feed synthetic latency curves; verify expected limit trajectory.
+- [x] Implement `AdaptiveController` with adjustment loop and blocking `acquire()` (`asyncio.Condition`, §5.2 — same pattern as `FixedController`, §3.1); reuses the `LatencyWindow` already implemented in Phase 2 §3.1, no new implementation needed.
+- [x] Wake blocked `acquire()` waiters whenever `_adjust()` raises `_limit` (§5.2) — an adaptive increase must be able to admit already-queued requests immediately, not just future ones.
+- [x] Implement cooldown period logic.
+- [x] Implement `RateWindow` for timeout-rate and 5xx-rate tracking (§5.1); wire into `AdaptiveController.release()`/`_adjust()` (§5.2) — replaces the placeholder `self._timeout_rate` reference with an actual rolling-window computation, and adds the previously-unimplemented 5xx-rate cooldown branch from the adjustment table (`requirements.md` §6.5).
+- [x] Log all limit change events with old/new limits and triggering p95.
+- [x] Unit tests: adjustment table, cooldown, min/max bounds.
+- [x] Unit tests: raising `_limit` at runtime unblocks an already-waiting `acquire()` immediately.
+- [x] Unit tests: `_adjust()` triggers the timeout-rate and error-rate cooldown branches at their configured thresholds, independent of p95.
+- [x] Simulation tests: feed synthetic latency curves; verify expected limit trajectory.
 
 ---
 
