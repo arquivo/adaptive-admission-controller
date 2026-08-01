@@ -412,17 +412,23 @@ HTTP Request
 
 ### 3.4 Tasks
 
-- [ ] Implement `FixedController` with blocking `acquire()` (`asyncio.Condition`, §3.1) — `acquire()` must never return without holding the slot; no boolean result for the caller to (mis)check.
-- [ ] Implement `LatencyWindow` (§3.1) and feed it from `FixedController.release()` — needed for FR-033a's projected-wait estimate on fixed backends, not just adaptive ones.
-- [ ] Implement `PriorityScheduler` with worker coroutine that waits for a capacity slot *before* popping the next request (§3.2), so a fresher higher-score request can't be stuck behind a stale lower-score one that already claimed a slot and is blocked on it.
-- [ ] Implement `estimate_wait_seconds()` and the FR-033a check in `PriorityScheduler.enqueue()` (§3.2): reject with `429`/`queue_wait_exceeded` when the projection already exceeds `queue_timeout_seconds`, without touching the queue; fails open (never rejects) when fewer than 10 latency samples exist yet.
-- [ ] Wire request lifecycle in `main.py` middleware.
-- [ ] Implement queue timeout (asyncio.wait_for) and 503 response on timeout.
-- [ ] Implement 429 response on `QueueFullError` (FR-033, reason `queue_full`) and on `QueueWaitExceededError` (FR-033a, reason `queue_wait_exceeded`) — distinct reasons, same status code.
-- [ ] Unit tests: fixed controller admit/reject at boundary, queue timeout.
-- [ ] Unit tests: a request popped after already being cancelled releases its acquired slot back (§3.2) instead of leaking capacity.
-- [ ] Unit tests: `estimate_wait_seconds()` — below the 10-sample minimum returns `0.0` (never rejects); at/above it, a queue depth × mean latency that exceeds `queue_timeout_seconds` raises `QueueWaitExceededError` before the queue is anywhere near `queue_max_size`.
-- [ ] Load test: verify fixed concurrency limit is enforced under sustained traffic, including under burst load — regression test for the original over-admission bug where a false/ignored `acquire()` result let dispatch proceed anyway.
+**Status: complete (2026-08-01).** Implemented per the approved plan (`/home/ibranco/.claude/plans/soft-mixing-moonbeam.md`). 69 unit + integration tests passing; full `docker compose up` smoke test verified all 6 backend paths still route correctly (502 on unreachable real upstreams, 404/403 unchanged from Phase 1), plus — against a temporary slow mock upstream substituted for one backend — genuine dispatch serialization under `concurrency_limit: 1` and `429 reason=queue_full` rejection under `queue_max_size: 1`.
+
+Two deliberate deviations from this section's illustrative pseudocode (full rationale in the plan file's Context section):
+- `Scheduler.next_request(backend_name)` (dead code, never called by the plan's own worker pseudocode) was dropped from the ABC and replaced with `run_worker(controller, dispatcher)`, matching what's actually driven at runtime.
+- `enqueue()` takes the real Starlette `Request` alongside `RequestContext` (`enqueue(request, request_context)`), and threads it through the queue entry to the dispatcher — `RequestContext` alone can't carry the live body stream needed for FR-054. Correspondingly, the dispatcher method is `dispatch_queued(request, ctx, future, controller)`, not `dispatch(ctx, future, controller)`.
+
+- [x] Implement `FixedController` with blocking `acquire()` (`asyncio.Condition`, §3.1) — `acquire()` must never return without holding the slot; no boolean result for the caller to (mis)check.
+- [x] Implement `LatencyWindow` (§3.1) and feed it from `FixedController.release()` — needed for FR-033a's projected-wait estimate on fixed backends, not just adaptive ones.
+- [x] Implement `PriorityScheduler` with worker coroutine that waits for a capacity slot *before* popping the next request (§3.2), so a fresher higher-score request can't be stuck behind a stale lower-score one that already claimed a slot and is blocked on it.
+- [x] Implement `estimate_wait_seconds()` and the FR-033a check in `PriorityScheduler.enqueue()` (§3.2): reject with `429`/`queue_wait_exceeded` when the projection already exceeds `queue_timeout_seconds`, without touching the queue; fails open (never rejects) when fewer than 10 latency samples exist yet.
+- [x] Wire request lifecycle in `main.py` middleware.
+- [x] Implement queue timeout (asyncio.wait_for) and 503 response on timeout.
+- [x] Implement 429 response on `QueueFullError` (FR-033, reason `queue_full`) and on `QueueWaitExceededError` (FR-033a, reason `queue_wait_exceeded`) — distinct reasons, same status code.
+- [x] Unit tests: fixed controller admit/reject at boundary, queue timeout.
+- [x] Unit tests: a request popped after already being cancelled releases its acquired slot back (§3.2) instead of leaking capacity.
+- [x] Unit tests: `estimate_wait_seconds()` — below the 10-sample minimum returns `0.0` (never rejects); at/above it, a queue depth × mean latency that exceeds `queue_timeout_seconds` raises `QueueWaitExceededError` before the queue is anywhere near `queue_max_size`.
+- [x] Load test: verify fixed concurrency limit is enforced under sustained traffic, including under burst load — regression test for the original over-admission bug where a false/ignored `acquire()` result let dispatch proceed anyway. (`tests/integration/test_proxy_e2e.py::test_concurrency_limit_of_one_genuinely_serializes_dispatch` and `::test_burst_beyond_queue_capacity_yields_queue_full_429`.)
 
 ---
 
