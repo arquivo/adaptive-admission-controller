@@ -59,6 +59,36 @@ adaptive_limit_changes_total = Counter(
     "adaptive_limit_changes_total", "Adaptive controller limit changes per backend.", ["backend"]
 )
 
+# Counters: ["backend", "instance"] — per-instance breakdown of the
+# backend-level `backend_errors_total`/connect-failure signal, added
+# alongside `LoadBalancer` (see app/load_balancer.py). Not added to the
+# latency histogram — per-instance latency buckets aren't worth the added
+# cardinality.
+backend_instance_errors_total = Counter(
+    "backend_instance_errors_total",
+    "Backend errors (5xx or unreachable) per backend instance.",
+    ["backend", "instance"],
+)
+backend_instance_connect_failures_total = Counter(
+    "backend_instance_connect_failures_total",
+    "Connection-level failures (port unreachable/refused) per backend instance.",
+    ["backend", "instance"],
+)
+
+# Gauges: ["backend", "instance"] — read straight from `LoadBalancer.
+# snapshot()` at scrape time (see `metrics_endpoint` below) rather than kept
+# in sync inline from `dispatcher.dispatch_queued`'s several exit paths.
+instance_inflight_requests = Gauge(
+    "admission_instance_inflight_requests",
+    "In-flight requests per backend instance.",
+    ["backend", "instance"],
+)
+instance_healthy = Gauge(
+    "admission_instance_healthy",
+    "Health state (1=healthy, 0=unhealthy) per backend instance.",
+    ["backend", "instance"],
+)
+
 # Histograms
 backend_request_duration_seconds = Histogram(
     "backend_request_duration_seconds",
@@ -79,6 +109,10 @@ score_distribution = Histogram(
 
 
 async def metrics_endpoint(request: Request) -> Response:
+    for name, load_balancer in request.app.state.load_balancers.items():
+        for status in load_balancer.snapshot():
+            instance_inflight_requests.labels(name, status.url).set(status.in_flight)
+            instance_healthy.labels(name, status.url).set(1 if status.healthy else 0)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

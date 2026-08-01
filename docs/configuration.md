@@ -174,12 +174,15 @@ Fields common to every backend (`_BackendCommon` in `app/config.py`):
 | Field | Type | Description |
 |---|---|---|
 | `name` | string, unique | Identifies the backend everywhere — metrics labels, Redis penalty keys, `/admin/backends/{name}/...`. |
-| `upstream_url` | http(s) URL | Where requests are actually proxied to. Only the scheme/host/port are used; the original request path and query string are forwarded unchanged (a drop-in replacement for an Apache `ProxyPass`). |
+| `upstreams` | non-empty list of `{url: http(s) URL}` | One or more physical instances of the same logical service. Only the scheme/host/port of each URL is used; the original request path and query string are forwarded unchanged (a drop-in replacement for an Apache `ProxyPass`). Duplicate URLs within one backend's list are rejected at load time. See [Multi-instance load balancing](#multi-instance-load-balancing) below for how requests are spread across more than one entry. |
 | `match.path_prefix` | string, unique | The path prefix this backend owns. Matching is longest-prefix-wins and path-segment-boundary aware, so `/noFrame/replay` and `/noFrame/patching` correctly resolve to distinct backends despite sharing a prefix. |
-| `connect_timeout_seconds` | float, > 0 | Upstream TCP connect timeout. |
+| `connect_timeout_seconds` | float, > 0 | Upstream TCP connect timeout — shared across every instance in `upstreams` (instances are assumed equal-capacity clones of the same service, so there's no per-instance override). |
 | `backend_timeout_seconds` | float, > 0 | Upstream read/write timeout — a distinct concern from `queue_timeout_seconds` below, which only bounds *queue wait*, not backend response time. |
 | `queue_max_size` | int, > 0 | Hard cap on this backend's priority queue depth. Exceeding it → `429`, `reason=queue_full`. |
 | `queue_timeout_seconds` | float, > 0 | Both the budget a queued request is allowed to wait before a `503 reason=queue_timeout`, *and* the threshold the predictive rejection compares its projected wait against (`429 reason=queue_wait_exceeded`). |
+| `health_check_interval_seconds` | float, > 0 | No effect for a single-instance backend. For a multi-instance backend, how often instances currently marked down are re-probed for recovery. Default `10`. |
+| `sticky_sessions` | bool | No effect for a single-instance backend. For a multi-instance backend, whether repeat requests from the same client IP are pinned to the same instance. Default `true`. |
+| `sticky_session_ttl_seconds` | float, > 0 | No effect when `sticky_sessions` is `false` or there's only one instance. How long a client's pin is kept after its last use before being dropped. Default `300`. |
 
 **`controller: fixed`** additionally requires:
 
@@ -199,12 +202,48 @@ Fields common to every backend (`_BackendCommon` in `app/config.py`):
 See [Architecture — Concurrency control](architecture.md#concurrency-control) for exactly how
 these interact.
 
+### Multi-instance load balancing
+
+A backend's `upstreams` list can name more than one physical instance of the same service (e.g.
+several identical replicas behind a load balancer VIP, or several uwsgi worker processes on
+different ports). The admission/queueing layer above (`concurrency_limit`/adaptive controller,
+priority queue) is entirely unaware of this — it still governs one shared pool of in-flight
+requests per backend *name*. A separate selection layer picks which instance serves each
+already-admitted request:
+
+- **Selection**: among currently-healthy instances, the one with the fewest in-flight requests
+  ("most capacity available") is chosen. There is no static weight to configure — this is
+  deliberate, since instances are assumed to be equal-capacity clones of the same service.
+- **Sticky sessions** (`sticky_sessions`, on by default): repeat requests from the same client IP
+  are pinned to whichever instance served them first, for up to `sticky_session_ttl_seconds` since
+  their last request. The pin is dropped — and a new one chosen — if that instance goes unhealthy,
+  or if it's carrying more than its fair share of load (`ceil(current_limit / healthy_instance_
+  count)`) while another healthy instance has real headroom below that share. If every instance is
+  equally at its fair share, the pin is kept rather than evicted for no reason.
+- **Health checking**: an instance the AAC can't connect to (connection refused, or no response
+  within `connect_timeout_seconds`) is marked down immediately and excluded from selection. A
+  background loop, every `health_check_interval_seconds`, re-probes only the currently-down
+  instances with a raw TCP connect and brings one back into rotation as soon as it accepts a
+  connection — no operator action needed. If every instance of a backend is down, selection fails
+  open (returns one anyway) rather than blocking or rejecting every request outright; the resulting
+  connection failure surfaces as the existing `502`/`connect_failed` bookkeeping.
+- **Observability**: `GET /metrics` exposes per-instance `admission_instance_inflight_requests` and
+  `admission_instance_healthy` gauges, and `GET /admin/backends/{name}/upstreams` returns a live
+  per-instance snapshot (url, healthy, in-flight count, sticky-pin count) — see
+  [API Reference](api_reference.md).
+
+See [Known Limitations](known_limitations.md) for the scope this deliberately doesn't cover (e.g.
+sticky-session state is in-memory per-process, and a partial outage doesn't shrink the backend's
+overall admission limit).
+
 ### Config-level validation
 
 `AACConfig` (`app/config.py`) additionally enforces, at load time:
 
 - No two backends share a `name`.
 - No two backends share a `match.path_prefix`.
+- No backend's `upstreams` list contains a duplicate URL (compared after normalizing trailing
+  slashes).
 - Every key under `scoring.overrides` must name a backend that actually exists in `backends`.
 - `ingress.trusted_proxies` entries must each parse as a valid IP network.
 - `auth.enabled: true` requires both `auth.issuer` and `auth.jwks_url` to be set.

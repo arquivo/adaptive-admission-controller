@@ -32,6 +32,7 @@ from app.errors import QueueFullError, QueueWaitExceededError
 from app.geoip import GeoIPLookup
 from app.health import routes as health_routes
 from app.ingress import TrustedProxyMiddleware
+from app.load_balancer import LeastLoadedLoadBalancer
 from app.metrics import routes as metrics_routes
 from app.penalty_store import RedisPenaltyStore
 from app.registry import BackendPolicyRegistry
@@ -74,12 +75,12 @@ def _build_lifespan(preloaded_config: AACConfig | None):
             },
         )
         app.state.registry = BackendPolicyRegistry(config, app.state.geoip, app.state.auth)
-        app.state.dispatchers = {
-            backend.name: BackendDispatcher(backend) for backend in config.backends
-        }
+
+        # Controllers are built before load balancers so each backend's
+        # `LeastLoadedLoadBalancer` can be given a `capacity_hint` bound to
+        # its own controller's `current_limit` (used for sticky-session
+        # fair-share eviction) without a circular construction order.
         app.state.controllers = {}
-        app.state.schedulers = {}
-        worker_tasks = [asyncio.create_task(app.state.auth.refresh_loop())]
         for backend in config.backends:
             if backend.controller == "fixed":
                 controller = FixedController(backend.concurrency_limit)
@@ -87,11 +88,34 @@ def _build_lifespan(preloaded_config: AACConfig | None):
             else:
                 controller = AdaptiveController(backend)
                 metrics.concurrency_limit.labels(backend.name).set(backend.initial_concurrency)
+            app.state.controllers[backend.name] = controller
+
+        app.state.load_balancers = {
+            backend.name: LeastLoadedLoadBalancer(
+                [str(u.url) for u in backend.upstreams],
+                connect_timeout_seconds=backend.connect_timeout_seconds,
+                health_check_interval_seconds=backend.health_check_interval_seconds,
+                sticky_enabled=backend.sticky_sessions,
+                sticky_ttl_seconds=backend.sticky_session_ttl_seconds,
+                capacity_hint=app.state.controllers[backend.name].current_limit,
+            )
+            for backend in config.backends
+        }
+        app.state.dispatchers = {
+            backend.name: BackendDispatcher(backend, app.state.load_balancers[backend.name])
+            for backend in config.backends
+        }
+        app.state.schedulers = {}
+        worker_tasks = [asyncio.create_task(app.state.auth.refresh_loop())]
+        for load_balancer in app.state.load_balancers.values():
+            worker_tasks.append(asyncio.create_task(load_balancer.health_check_loop()))
+        for backend in config.backends:
+            controller = app.state.controllers[backend.name]
+            if backend.controller == "adaptive":
                 worker_tasks.append(asyncio.create_task(controller.adjust_loop()))
             scheduler = PriorityScheduler(
                 backend.name, backend.queue_max_size, backend.queue_timeout_seconds, controller
             )
-            app.state.controllers[backend.name] = controller
             app.state.schedulers[backend.name] = scheduler
             worker_tasks.append(
                 asyncio.create_task(

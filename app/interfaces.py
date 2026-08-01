@@ -117,3 +117,53 @@ class PenaltyStore(ABC):
 
     @abstractmethod
     async def increment_and_get(self, key: str, ttl_seconds: int) -> int: ...
+
+
+@dataclass(frozen=True)
+class UpstreamInstance:
+    """One physical upstream server behind a logical backend name."""
+
+    url: str
+
+
+@dataclass(frozen=True)
+class InstanceStatus:
+    """Read-only snapshot of one instance's selection-relevant state,
+    exposed via `LoadBalancer.snapshot()` (used by the admin API)."""
+
+    url: str
+    healthy: bool
+    in_flight: int
+    sticky_count: int = 0
+
+
+class LoadBalancer(ABC):
+    """Picks which physical instance of a backend's `upstreams` serves an
+    already-admitted request (`docs/development.md` "Adding a new pluggable
+    component in general"). Sits below `CapacityController`/`Scheduler` —
+    those still gate/queue by backend *name*; `LoadBalancer` only decides
+    *which instance* once a request has already been admitted.
+
+    LeastLoadedLoadBalancer is the sole production implementation.
+    """
+
+    @abstractmethod
+    async def select(self, ctx: RequestContext) -> UpstreamInstance:
+        """Selects an instance and reserves capacity on it atomically —
+        callers must not assume `select()` is side-effect-free. Always
+        returns an instance (fails open if every instance is unhealthy)."""
+        ...
+
+    @abstractmethod
+    async def release(self, instance: UpstreamInstance, *, connect_failed: bool) -> None:
+        """Releases capacity reserved by a prior `select()`. `connect_failed`
+        signals a connection-level failure (port unreachable/refused) —
+        implementations may use this to mark the instance down; a slow-but-
+        connected response must pass `connect_failed=False`."""
+        ...
+
+    @abstractmethod
+    def snapshot(self) -> list[InstanceStatus]:
+        """Read-only view of every instance's current state, for the admin
+        API and metrics scraping."""
+        ...

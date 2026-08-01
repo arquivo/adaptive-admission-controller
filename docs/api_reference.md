@@ -43,6 +43,10 @@ module-level singletons defined in `app/metrics.py`:
 | `backend_errors_total` | Counter | `backend` | Backend 5xx or unreachable — tracked separately from admission rejections. |
 | `backend_timeouts_total` | Counter | `backend` | Backend dispatch (connect/read) timeouts. |
 | `adaptive_limit_changes_total` | Counter | `backend` | Every time `AdaptiveController._adjust()` changes the limit. |
+| `backend_instance_errors_total` | Counter | `backend`, `instance` | Per-instance breakdown of `backend_errors_total`. |
+| `backend_instance_connect_failures_total` | Counter | `backend`, `instance` | Per-instance connection failures (port unreachable/refused) — the subset of `backend_instance_errors_total` that also marked the instance down. |
+| `admission_instance_inflight_requests` | Gauge | `backend`, `instance` | In-flight requests on one instance — read from `LoadBalancer.snapshot()` at scrape time, not incremented inline. |
+| `admission_instance_healthy` | Gauge | `backend`, `instance` | `1` if the instance is currently in rotation, `0` if marked down — read from `LoadBalancer.snapshot()` at scrape time. |
 | `backend_request_duration_seconds` | Histogram | `backend`, `class` | Backend latency. |
 | `queue_wait_duration_seconds` | Histogram | `backend`, `class` | Time spent queued before dispatch. |
 | `score_distribution` | Histogram | `backend`, `exempt` | Score histogram, 10-wide buckets from -100 to 100. |
@@ -57,7 +61,7 @@ positionally, never as `.labels(class=...)`.
 
 ## Admin API
 
-All three routes require `Authorization: Bearer <token>`, matched against `AAC_ADMIN_API_TOKEN`
+All four routes require `Authorization: Bearer <token>`, matched against `AAC_ADMIN_API_TOKEN`
 via `secrets.compare_digest`. **Fail-closed by design**: if `AAC_ADMIN_API_TOKEN` is unset, every
 route returns `403 {"detail": "admin API disabled"}` regardless of any header sent — there is no
 "admin API open by default" state. A present-but-wrong token returns `401 {"detail":
@@ -78,7 +82,9 @@ Summary of every configured backend:
       "controller_type": "adaptive",
       "current_limit": 50,
       "mean_latency_ms": 128.4,
-      "queue_size": 0
+      "queue_size": 0,
+      "upstream_count": 1,
+      "healthy_upstream_count": 1
     }
   ]
 }
@@ -111,6 +117,27 @@ governs its penalties right now, not just the override fragment in YAML):
 
 Same `404` behavior as above for an unknown name. This is a narrower, cheaper version of the
 `policy` route's `current_limit`, useful for a quick monitoring poll.
+
+### `GET /admin/backends/{name}/upstreams`
+
+Live per-instance status from `LoadBalancer.snapshot()` — the same data the two per-instance
+gauges above expose, but readable on demand without scraping `/metrics`:
+
+```json
+{
+  "backend": "pywb-framed",
+  "sticky_sessions": true,
+  "upstreams": [
+    { "url": "http://pywb-framed-1:8080/", "healthy": true, "in_flight": 2, "sticky_count": 5 },
+    { "url": "http://pywb-framed-2:8080/", "healthy": false, "in_flight": 0, "sticky_count": 0 }
+  ]
+}
+```
+
+Same `404` behavior as the other two per-backend routes for an unknown name. `sticky_count` is how
+many clients currently have a live sticky pin to that instance — it does not itself expire pins,
+only reports the current in-memory state (see
+[Architecture — Instance selection](architecture.md#instance-selection)).
 
 ## Diagnostic response headers
 

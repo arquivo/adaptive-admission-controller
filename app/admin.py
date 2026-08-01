@@ -45,6 +45,7 @@ def _backend_summary(name: str, request: Request) -> dict:
     policy = request.app.state.registry.all_policies()[name]
     controller = request.app.state.controllers[name]
     scheduler = request.app.state.schedulers[name]
+    upstreams = request.app.state.load_balancers[name].snapshot()
     return {
         "name": name,
         "path_prefix": policy.config.match.path_prefix,
@@ -52,6 +53,8 @@ def _backend_summary(name: str, request: Request) -> dict:
         "current_limit": controller.current_limit(),
         "mean_latency_ms": controller.mean_latency_ms(),
         "queue_size": scheduler.queue_size(),
+        "upstream_count": len(upstreams),
+        "healthy_upstream_count": sum(1 for u in upstreams if u.healthy),
     }
 
 
@@ -87,8 +90,33 @@ async def backend_limit(request: Request) -> Response:
     return JSONResponse({"backend": name, "current_limit": controllers[name].current_limit()})
 
 
+@_require_admin_auth
+async def backend_upstreams(request: Request) -> Response:
+    name = request.path_params["name"]
+    policies = request.app.state.registry.all_policies()
+    if name not in policies:
+        return JSONResponse({"detail": "unknown backend"}, status_code=404)
+    load_balancer = request.app.state.load_balancers[name]
+    return JSONResponse(
+        {
+            "backend": name,
+            "sticky_sessions": policies[name].config.sticky_sessions,
+            "upstreams": [
+                {
+                    "url": status.url,
+                    "healthy": status.healthy,
+                    "in_flight": status.in_flight,
+                    "sticky_count": status.sticky_count,
+                }
+                for status in load_balancer.snapshot()
+            ],
+        }
+    )
+
+
 routes = [
     Route("/admin/backends", list_backends, methods=["GET"]),
     Route("/admin/backends/{name}/policy", backend_policy, methods=["GET"]),
     Route("/admin/backends/{name}/limit", backend_limit, methods=["GET"]),
+    Route("/admin/backends/{name}/upstreams", backend_upstreams, methods=["GET"]),
 ]

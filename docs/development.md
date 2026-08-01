@@ -20,6 +20,7 @@ app/
   capacity.py       FixedController, AdaptiveController
   scheduler.py      PriorityScheduler
   dispatcher.py     BackendDispatcher
+  load_balancer.py  LeastLoadedLoadBalancer
   geoip.py          GeoIPLookup
   auth.py           JWTVerifier
   observability.py  JSON logging
@@ -44,7 +45,10 @@ No code change is required — this is purely a `config/backends.yaml` edit. Add
 
 ```yaml
   - name: my-new-backend
-    upstream_url: http://my-new-backend:8080
+    upstreams:
+      - url: http://my-new-backend:8080
+      # add more entries here for a horizontally-scaled backend — see
+      # Configuration Reference — Multi-instance load balancing
     match:
       path_prefix: /my-prefix
     controller: fixed          # or adaptive
@@ -115,14 +119,14 @@ the four interface methods, never a concrete class.
 
 ## Adding a new pluggable component in general
 
-`BackendPolicy` and `PenaltyStore` are the other two `ABC`s in `app/interfaces.py`. Both currently
-have exactly one production implementation (`DefaultBackendPolicy` in `app/registry.py`,
-`RedisPenaltyStore` in `app/penalty_store.py`) — this is deliberate (see
-[the decision log entry on `PenaltyStore`](old/decision_log.md), Part D, D3): the abstraction
-exists for testability (swap in a fake for unit tests), not because multiple production backends
-are planned. If you do add a second real implementation, follow the same shape: implement every
-abstract method, wire construction into `app/main.py`'s lifespan, and add config fields to select
-between implementations if that becomes necessary.
+`BackendPolicy`, `PenaltyStore`, and `LoadBalancer` are the other `ABC`s in `app/interfaces.py`. All
+currently have exactly one production implementation (`DefaultBackendPolicy` in `app/registry.py`,
+`RedisPenaltyStore` in `app/penalty_store.py`, `LeastLoadedLoadBalancer` in `app/load_balancer.py`)
+— this is deliberate (see [the decision log entry on `PenaltyStore`](old/decision_log.md), Part D,
+D3): the abstraction exists for testability (swap in a fake for unit tests), not because multiple
+production backends are planned. If you do add a second real implementation, follow the same
+shape: implement every abstract method, wire construction into `app/main.py`'s lifespan, and add
+config fields to select between implementations if that becomes necessary.
 
 ## Testing philosophy
 

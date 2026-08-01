@@ -4,7 +4,8 @@ An async reverse proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and its backend services. It protects those backends from overload with
 per-backend concurrency control (fixed or adaptive), and keeps things fair under contention with a
 Redis-backed reputation score that prioritizes legitimate traffic — without ever hard-blocking a
-client outright.
+client outright. A backend can also be horizontally scaled across multiple upstream instances,
+load-balanced by available capacity with sticky sessions and automatic health-based failover.
 
 See [docs/overview.md](docs/overview.md) for the full picture, or jump straight to what you need:
 

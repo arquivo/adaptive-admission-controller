@@ -114,7 +114,7 @@ _BASE_CONFIG: dict = {
     "backends": [
         {
             "name": "page-search-api",
-            "upstream_url": "http://page-search-api:8080",
+            "upstreams": [{"url": "http://page-search-api:8080"}],
             "match": {"path_prefix": "/textsearch"},
             "controller": "adaptive",
             "min_concurrency": 20,
@@ -130,7 +130,7 @@ _BASE_CONFIG: dict = {
         },
         {
             "name": "image-search-api",
-            "upstream_url": "http://image-search-api:8080",
+            "upstreams": [{"url": "http://image-search-api:8080"}],
             "match": {"path_prefix": "/imagesearch"},
             "controller": "adaptive",
             "min_concurrency": 20,
@@ -146,7 +146,7 @@ _BASE_CONFIG: dict = {
         },
         {
             "name": "pywb-framed",
-            "upstream_url": "http://pywb-framed:8080",
+            "upstreams": [{"url": "http://pywb-framed:8080"}],
             "match": {"path_prefix": "/wayback"},
             "controller": "fixed",
             "concurrency_limit": 100,
@@ -157,7 +157,7 @@ _BASE_CONFIG: dict = {
         },
         {
             "name": "pywb-noframe",
-            "upstream_url": "http://pywb-noframe:8081",
+            "upstreams": [{"url": "http://pywb-noframe:8081"}],
             "match": {"path_prefix": "/noFrame/replay"},
             "controller": "fixed",
             "concurrency_limit": 100,
@@ -168,7 +168,7 @@ _BASE_CONFIG: dict = {
         },
         {
             "name": "pywb-patching",
-            "upstream_url": "http://pywb-patching:8082",
+            "upstreams": [{"url": "http://pywb-patching:8082"}],
             "match": {"path_prefix": "/noFrame/patching"},
             "controller": "fixed",
             "concurrency_limit": 10,
@@ -179,7 +179,7 @@ _BASE_CONFIG: dict = {
         },
         {
             "name": "pywb-archivepagenow",
-            "upstream_url": "http://pywb-archivepagenow:8083",
+            "upstreams": [{"url": "http://pywb-archivepagenow:8083"}],
             "match": {"path_prefix": "/save"},
             "controller": "fixed",
             "concurrency_limit": 5,

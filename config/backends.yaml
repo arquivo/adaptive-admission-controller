@@ -87,7 +87,7 @@ backends:
   # --- Search APIs (2 independent services, separate hardware/collections;
   # each talks to its own SolrCloud cluster internally) ---
   - name: page-search-api
-    upstream_url: http://page-search-api:8080 # environment-specific — see docs/open_tbd.md
+    upstreams: [{ url: http://page-search-api:8080 }] # environment-specific — see docs/open_tbd.md
     match:
       path_prefix: /textsearch
     controller: adaptive
@@ -103,7 +103,7 @@ backends:
     queue_timeout_seconds: 300
 
   - name: image-search-api
-    upstream_url: http://image-search-api:8080 # environment-specific — see docs/open_tbd.md
+    upstreams: [{ url: http://image-search-api:8080 }] # environment-specific — see docs/open_tbd.md
     match:
       path_prefix: /imagesearch
     controller: adaptive
@@ -120,7 +120,17 @@ backends:
 
   # --- pywb (4 independent uwsgi processes, own port each) ---
   - name: pywb-framed
-    upstream_url: http://pywb-framed:8080
+    # Illustrative multi-instance example: two identical replicas of the
+    # same pywb-framed service behind one backend name. `upstreams` accepts
+    # any number of entries — the AAC selects whichever currently-healthy
+    # instance has the fewest in-flight requests ("most capacity
+    # available"), and pins repeat clients to the same instance by default
+    # (`sticky_sessions`, on unless overridden below) unless that instance
+    # goes down or the backend as a whole is saturated. See
+    # docs/configuration.md "Multi-instance load balancing".
+    upstreams:
+      - url: http://pywb-framed-1:8080
+      - url: http://pywb-framed-2:8080
     match:
       path_prefix: /wayback
     controller: fixed
@@ -129,9 +139,12 @@ backends:
     backend_timeout_seconds: 60
     queue_max_size: 2000
     queue_timeout_seconds: 300
+    health_check_interval_seconds: 10 # how often down instances are re-probed
+    sticky_sessions: true # default; set false to disable client pinning
+    sticky_session_ttl_seconds: 300 # a pin idle this long is dropped
 
   - name: pywb-noframe
-    upstream_url: http://pywb-noframe:8081
+    upstreams: [{ url: http://pywb-noframe:8081 }]
     match:
       path_prefix: /noFrame/replay
     controller: fixed
@@ -142,7 +155,7 @@ backends:
     queue_timeout_seconds: 300
 
   - name: pywb-patching
-    upstream_url: http://pywb-patching:8082
+    upstreams: [{ url: http://pywb-patching:8082 }]
     match:
       path_prefix: /noFrame/patching
     controller: fixed
@@ -153,7 +166,7 @@ backends:
     queue_timeout_seconds: 300
 
   - name: pywb-archivepagenow
-    upstream_url: http://pywb-archivepagenow:8083
+    upstreams: [{ url: http://pywb-archivepagenow:8083 }]
     match:
       path_prefix: /save
     controller: fixed

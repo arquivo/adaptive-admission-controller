@@ -173,14 +173,32 @@ class MatchConfig(BaseModel):
     path_prefix: str
 
 
+class UpstreamConfig(BaseModel):
+    url: HttpUrl
+
+
 class _BackendCommon(BaseModel):
     name: str
-    upstream_url: HttpUrl
+    upstreams: list[UpstreamConfig] = Field(min_length=1)
     match: MatchConfig
     connect_timeout_seconds: float = Field(gt=0)
     backend_timeout_seconds: float = Field(gt=0)
     queue_max_size: int = Field(gt=0)
     queue_timeout_seconds: float = Field(gt=0)
+    health_check_interval_seconds: float = Field(default=10, gt=0)
+    sticky_sessions: bool = True
+    sticky_session_ttl_seconds: float = Field(default=300, gt=0)
+
+    @field_validator("upstreams")
+    @classmethod
+    def _check_unique_upstreams(cls, value: list[UpstreamConfig]) -> list[UpstreamConfig]:
+        seen: set[str] = set()
+        for upstream in value:
+            key = str(upstream.url).rstrip("/")
+            if key in seen:
+                raise ValueError(f"duplicate upstream url in `upstreams`: {upstream.url}")
+            seen.add(key)
+        return value
 
 
 class FixedBackendConfig(_BackendCommon):

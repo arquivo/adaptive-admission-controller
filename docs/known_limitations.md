@@ -31,7 +31,7 @@ per-environment tuning before a real rollout, independent of any further design 
 | Value | Current placeholder | Why it can't be resolved centrally |
 |---|---|---|
 | Per-backend concurrency limits (`concurrency_limit`, `initial_concurrency`/`min_concurrency`/`max_concurrency`) | See [Deployment — Tentative initial production limits](deployment.md#tentative-initial-production-limits) | Depends on the actual server/cluster capacity behind each backend in a given deployment; needs real load-test data (`scripts/load_test.py`) per install. |
-| Backend `upstream_url` hosts/ports | Illustrative hostnames (`page-search-api:8080`, etc.) | Real arquivo.pt services, but the actual host/port depends on which server/cluster a given deployment targets. |
+| Backend `upstreams` hosts/ports | Illustrative hostnames (`page-search-api:8080`, etc.) | Real arquivo.pt services, but the actual host/port depends on which server/cluster a given deployment targets. |
 | `connect_timeout_seconds` / `backend_timeout_seconds` | 5s/60s for most backends, 10s/120s for `pywb-archivepagenow` (it fetches a live page, not an archived one) | Reasonable starting defaults, but tuned per deployment against real backend latency characteristics. |
 | `geoip.city_db_path` / `geoip.asn_db_path` | `/var/lib/aac/GeoLite2-City.mmdb` / `/var/lib/aac/GeoLite2-ASN.mmdb` | Real filesystem paths depend on where a given deployment stores the MaxMind databases; the *refresh mechanism* itself (`scripts/update_geoip_db.py`) is fully implemented — see [Deployment — GeoIP/ASN database refresh](deployment.md#geoip-asn-database-refresh). |
 | `ingress.trusted_proxies` | `["127.0.0.1", "::1"]` (co-located front-end default) | Must name whatever host(s) actually run Apache/Caddy in front of a given AAC instance — not resolvable without knowing the topology. |
@@ -44,6 +44,31 @@ None of these are open design questions — the *shape* of every value above is 
 
 Not applicable while request cost is uniformly `1` (see above) — this only becomes relevant if
 weighted cost is implemented.
+
+## Multi-instance load balancing scope limits
+
+Three deliberate scope cuts in `LeastLoadedLoadBalancer` (`app/load_balancer.py`, see
+[Architecture — Instance selection](architecture.md#instance-selection)), each stated explicitly
+rather than silently assumed:
+
+- **Sticky-session state is in-memory, per-process only.** The client-IP → pinned-instance map
+  lives in one `LeastLoadedLoadBalancer` object per backend, inside one process. This is fine
+  today — there is no evidence the AAC itself runs as more than one process — but a client's pin
+  would not be shared if that ever changed; a multi-process deployment would need Redis-backed
+  sticky state instead.
+- **A backend's overall admission limit doesn't shrink when some instances are down.**
+  `CapacityController.current_limit()` (the shared per-backend concurrency cap enforced *above*
+  instance selection) is entirely unaware of how many of that backend's `upstreams` are currently
+  healthy — a partial outage (e.g. one of three instances down) funnels the full configured
+  concurrency onto the survivors rather than reducing it proportionally. Fixing this would mean
+  wiring `LoadBalancer` health state into `AdaptiveController`'s existing shrink/grow logic, which
+  needs product sign-off on the intended behavior (e.g. should `fixed`-controller backends also
+  shrink?) rather than being a purely mechanical change.
+- **Connect/read timeouts are shared per-backend, not per-instance.** `connect_timeout_seconds`/
+  `backend_timeout_seconds` apply identically to every entry in a backend's `upstreams` — there is
+  no way to give one instance a longer timeout than its siblings. This is consistent with the
+  no-per-instance-weight design decision (instances are assumed to be equal-capacity clones of the
+  same service); a genuinely heterogeneous fleet behind one backend name isn't supported.
 
 ## Everything else is resolved
 

@@ -20,6 +20,7 @@ it*, see [Extending the AAC](development.md).
 | `app/capacity.py` | `FixedController` and `AdaptiveController` — the two `CapacityController` implementations, plus the `LatencyWindow`/`RateWindow` rolling-sample helpers they share. |
 | `app/scheduler.py` | `PriorityScheduler` — the per-backend priority queue, predictive queue-wait rejection, and the worker loop that pairs a capacity slot with the highest-score queued request. |
 | `app/dispatcher.py` | `BackendDispatcher` — streams a request to its backend and streams the response back, without full in-memory buffering. |
+| `app/load_balancer.py` | `LeastLoadedLoadBalancer` — the sole `LoadBalancer` implementation; picks which physical instance of a backend serves an already-admitted request, tracks per-instance health, and owns sticky-session state. |
 | `app/geoip.py` | `GeoIPLookup` — reads two local MaxMind `.mmdb` files (country, ASN) at startup; per-file fail-open. |
 | `app/auth.py` | `JWTVerifier` — verifies a bearer token against a Keycloak JWKS endpoint to derive `user_class`/`user_id`; fails open to "no verifiable token." |
 | `app/observability.py` | JSON log formatter (`configure_logging`) and `log_admission_event()`, the one-line-per-decision structured log. |
@@ -83,11 +84,13 @@ Walking through each stage:
 7. Meanwhile, one `PriorityScheduler.run_worker()` task per backend runs forever: it calls
    `controller.acquire(1)` (blocks until a capacity slot is free), pops the highest-score item
    currently in the queue, and hands it to `BackendDispatcher.dispatch_queued()` as a detached
-   task. That dispatch streams the request upstream, streams the response back, and finally
-   resolves the `Future` with the resulting `Response` — always releasing the capacity slot
-   (`controller.release(...)`) regardless of outcome (success, backend timeout, backend
-   connection error, or the future having already been cancelled because the original request
-   gave up first).
+   task. That dispatch first asks the backend's `LoadBalancer.select(ctx)` which physical instance
+   to use (see [Instance selection](#instance-selection) below), then streams the request
+   upstream, streams the response back, and finally resolves the `Future` with the resulting
+   `Response` — always releasing both the capacity slot (`controller.release(...)`) and the
+   instance's in-flight count (`load_balancer.release(...)`) regardless of outcome (success,
+   backend timeout, backend connection error, or the future having already been cancelled because
+   the original request gave up first).
 
 Every outcome that reaches step 7's dispatch — including a backend-originated `502`/`503` — counts
 as **admitted**, not rejected: `admission_rejected_total` only increments for admission-control
@@ -121,6 +124,44 @@ bug from an earlier design iteration).
   `LatencyWindow` (mean + p95 over the last 100 samples) is shared by both controllers — even
   `FixedController` tracks it, since the scheduler's predictive queue-wait rejection needs a mean
   service-time estimate for every backend, not just adaptive ones.
+
+## Instance selection
+
+`LeastLoadedLoadBalancer` (`app/load_balancer.py`) sits inside `BackendDispatcher.dispatch_queued`,
+strictly *below* the admission/backpressure layer described above — it never affects whether a
+request is admitted, only which of a backend's `upstreams` entries an already-admitted request is
+sent to. One instance is constructed per backend in `main.py`'s lifespan and handed to that
+backend's `BackendDispatcher`; a single-instance backend degenerates to a no-op.
+
+- **Selection** picks the healthy instance with the fewest in-flight requests, incrementing that
+  count in the same `asyncio.Lock`-held critical section as the pick itself — this atomicity is
+  what stops a concurrent burst from all observing the same "least loaded" instance and piling
+  onto it. `release()` (called from every one of `dispatch_queued`'s exit paths, mirroring
+  `controller.release(...)`) decrements it again.
+- **Health** is two-sided. Passively, `httpx.ConnectError`/`httpx.ConnectTimeout` (connection
+  refused, or no response within `connect_timeout_seconds`) marks an instance down immediately via
+  `release(instance, connect_failed=True)` — this exception pair must be caught *before* the
+  existing `except httpx.TimeoutException:` branch, since `ConnectTimeout` is a subclass of both;
+  swapping the order makes the down-marking branch dead code. Actively, `health_check_loop()`
+  (started alongside the app lifespan, one per backend, same cadence as
+  `health_check_interval_seconds`) raw-TCP-connects to only the currently-down instances and marks
+  one healthy again as soon as it accepts a connection. If every instance is down, `select()` fails
+  open — it still returns one rather than blocking or inventing a new rejection path; the resulting
+  connection failure is just today's `502` from the unchanged exception handling.
+- **Sticky sessions** key on `ctx.source_ip` (already populated by `classify()` — no new plumbing).
+  A `dict[str, tuple[str, float]]` maps client IP → `(pinned instance, last-used monotonic time)`.
+  A pin is honored unless it's expired (`sticky_session_ttl_seconds` since last use), its instance
+  is no longer healthy, or the *fair-share eviction rule* fires: `fair_share = ceil(capacity_hint()
+  / healthy_instance_count)`, where `capacity_hint` is a bound `controller.current_limit` reference
+  (not a live object — keeps `LoadBalancer` decoupled from `CapacityController` as a type). A pin
+  is evicted only when its instance is at or above `fair_share` *and* a healthy alternative is
+  strictly below it; if every instance is equally saturated, the pin is kept. Expired entries are
+  swept on the same tick as `health_check_loop`, rather than adding a second background task.
+- **Observability**: `snapshot()` returns a per-instance `(url, healthy, in_flight, sticky_count)`
+  list, read by `GET /metrics` (gauges, at scrape time) and `GET /admin/backends/{name}/upstreams`
+  (see [API Reference](api_reference.md)).
+
+See [Known Limitations](known_limitations.md) for what this deliberately leaves out of scope.
 
 ## Priority scheduling
 

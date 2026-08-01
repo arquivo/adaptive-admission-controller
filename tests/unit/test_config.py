@@ -85,3 +85,40 @@ def test_invalid_ipv6_prefix_length_fails(base_config_dict):
     base_config_dict["scoring"]["ipv6_prefix_length"] = 64
     with pytest.raises(ValidationError):
         AACConfig.model_validate(base_config_dict)
+
+
+def test_empty_upstreams_list_fails(base_config_dict):
+    base_config_dict["backends"][0]["upstreams"] = []
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_duplicate_upstream_url_fails(base_config_dict):
+    base_config_dict["backends"][0]["upstreams"] = [
+        {"url": "http://page-search-api-1:8080"},
+        {"url": "http://page-search-api-1:8080"},
+    ]
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_duplicate_upstream_url_trailing_slash_fails(base_config_dict):
+    base_config_dict["backends"][0]["upstreams"] = [
+        {"url": "http://page-search-api-1:8080"},
+        {"url": "http://page-search-api-1:8080/"},
+    ]
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_multiple_upstreams_parse_in_order(base_config_dict):
+    base_config_dict["backends"][0]["upstreams"] = [
+        {"url": "http://page-search-api-1:8080"},
+        {"url": "http://page-search-api-2:8080"},
+    ]
+    config = AACConfig.model_validate(base_config_dict)
+    backend = next(b for b in config.backends if b.name == "page-search-api")
+    assert [str(u.url) for u in backend.upstreams] == [
+        "http://page-search-api-1:8080/",
+        "http://page-search-api-2:8080/",
+    ]

@@ -21,7 +21,7 @@ def _adaptive_config(
 ) -> AdaptiveBackendConfig:
     return AdaptiveBackendConfig(
         name="test-backend",
-        upstream_url="http://test-backend:8080",
+        upstreams=[{"url": "http://test-backend:8080"}],
         match={"path_prefix": "/test"},
         connect_timeout_seconds=5,
         backend_timeout_seconds=60,

@@ -176,6 +176,8 @@ async def test_admin_backends_list_returns_summary_with_correct_token(mock_backe
     assert entry["controller_type"] == "fixed"
     assert entry["current_limit"] == 100
     assert entry["queue_size"] == 0
+    assert entry["upstream_count"] == 1
+    assert entry["healthy_upstream_count"] == 1
 
 
 async def test_admin_backend_policy_returns_config_and_scoring(mock_backend, monkeypatch):
@@ -216,3 +218,56 @@ async def test_admin_backend_limit_returns_current_limit(mock_backend, monkeypat
 
     assert response.status_code == 200
     assert response.json() == {"backend": "mock-backend", "current_limit": 42}
+
+
+async def test_admin_backend_upstreams_returns_per_instance_status(mock_backend, monkeypatch):
+    monkeypatch.setenv("AAC_ADMIN_API_TOKEN", "correct-token")
+    config = make_config(mock_backend)
+    async with running_app(config) as (_app, client):
+        response = await client.get(
+            "/admin/backends/mock-backend/upstreams",
+            headers={"Authorization": "Bearer correct-token"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["backend"] == "mock-backend"
+    assert body["sticky_sessions"] is True
+    assert len(body["upstreams"]) == 1
+    upstream = body["upstreams"][0]
+    # `HttpUrl` normalizes a bare host:port into a URL with a trailing "/",
+    # which is what `LeastLoadedLoadBalancer` uses as its dict key internally.
+    assert upstream["url"] == f"{mock_backend}/"
+    assert upstream["healthy"] is True
+    assert upstream["in_flight"] == 0
+    assert upstream["sticky_count"] == 0
+
+
+async def test_admin_backend_upstreams_unknown_backend_returns_404(mock_backend, monkeypatch):
+    monkeypatch.setenv("AAC_ADMIN_API_TOKEN", "correct-token")
+    config = make_config(mock_backend)
+    async with running_app(config) as (_app, client):
+        response = await client.get(
+            "/admin/backends/does-not-exist/upstreams",
+            headers={"Authorization": "Bearer correct-token"},
+        )
+
+    assert response.status_code == 404
+
+
+async def test_metrics_endpoint_reports_per_instance_gauges(mock_backend, monkeypatch):
+    monkeypatch.setenv("AAC_ADMIN_API_TOKEN", "correct-token")
+    config = make_config(mock_backend)
+    async with running_app(config) as (_app, client):
+        response = await client.get("/proxytest/echo")
+        assert response.status_code == 200
+
+        metrics_response = await client.get("/metrics")
+
+    body = metrics_response.text
+    instance = f"{mock_backend}/"
+    assert (
+        f'admission_instance_inflight_requests{{backend="mock-backend",instance="{instance}"}} 0.0'
+        in body
+    )
+    assert f'admission_instance_healthy{{backend="mock-backend",instance="{instance}"}} 1.0' in body

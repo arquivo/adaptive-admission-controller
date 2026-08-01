@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from starlette.requests import Request
 
-    from app.interfaces import CapacityController, RequestContext
+    from app.interfaces import CapacityController, LoadBalancer, RequestContext, UpstreamInstance
 
 # Headers that are connection-specific and must never be forwarded verbatim
 # in either direction (RFC 7230 §6.1 plus Host, which must be recomputed by
@@ -49,8 +49,10 @@ class BackendDispatcher:
     `Limits` at client construction, not per-request).
     """
 
-    def __init__(self, config: BackendConfig):
+    def __init__(self, config: BackendConfig, load_balancer: LoadBalancer):
         self._config = config
+        self._load_balancer = load_balancer
+        instance_count = len(config.upstreams)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=config.connect_timeout_seconds,
@@ -58,21 +60,27 @@ class BackendDispatcher:
                 write=config.backend_timeout_seconds,
                 pool=config.connect_timeout_seconds,
             ),
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+            limits=httpx.Limits(
+                max_connections=200 * instance_count,
+                max_keepalive_connections=50 * instance_count,
+            ),
         )
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _send_and_stream(self, request: Request) -> tuple[httpx.Response, Response]:
-        """Sends `request` upstream and returns both the raw `httpx.Response`
-        (for status/latency bookkeeping) and the `StreamingResponse` wrapping
-        its body. Raises `httpx.HTTPError` (including `httpx.TimeoutException`)
-        on connect/send failure — callers decide the resulting status code."""
+    async def _send_and_stream(
+        self, request: Request, instance: UpstreamInstance
+    ) -> tuple[httpx.Response, Response]:
+        """Sends `request` to `instance` and returns both the raw
+        `httpx.Response` (for status/latency bookkeeping) and the
+        `StreamingResponse` wrapping its body. Raises `httpx.HTTPError`
+        (including `httpx.TimeoutException`) on connect/send failure —
+        callers decide the resulting status code."""
         # `match.path_prefix` is used only for backend *selection* (see
         # app.registry) — the original path is forwarded unchanged, matching
         # a drop-in replacement for Apache's ProxyPass.
-        url = httpx.URL(str(self._config.upstream_url)).copy_with(
+        url = httpx.URL(instance.url).copy_with(
             path=request.url.path,
             query=request.url.query.encode() if request.url.query else None,
         )
@@ -125,10 +133,38 @@ class BackendDispatcher:
         not an admission-control rejection."""
         name = self._config.name
         class_label = ctx.user_class or "unknown"
+        instance = await self._load_balancer.select(ctx)
         start = time.monotonic()
         try:
-            upstream_response, response = await self._send_and_stream(request)
+            upstream_response, response = await self._send_and_stream(request, instance)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # "Can't connect, port not available" — a connectivity problem,
+            # not a slow-response one. Must be caught before the (slower-
+            # response) `httpx.TimeoutException` branch below: `ConnectTimeout`
+            # is a subclass of *both* `TimeoutException` and `ConnectError`,
+            # so this ordering is load-bearing — swap it and this branch
+            # becomes dead code that silently never fires.
+            await self._load_balancer.release(instance, connect_failed=True)
+            latency_ms = (time.monotonic() - start) * 1000
+            await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=False)
+            metrics.backend_errors_total.labels(name).inc()
+            metrics.backend_instance_errors_total.labels(name, instance.url).inc()
+            metrics.backend_instance_connect_failures_total.labels(name, instance.url).inc()
+            metrics.backend_request_duration_seconds.labels(name, class_label).observe(
+                latency_ms / 1000
+            )
+            observability.log_admission_event(
+                "admitted",
+                ctx,
+                queue_wait_ms=queue_wait_ms,
+                backend_latency_ms=latency_ms,
+                status_code=502,
+            )
+            if not future.cancelled():
+                future.set_result(JSONResponse({"detail": "bad gateway"}, status_code=502))
+            return
         except httpx.TimeoutException:
+            await self._load_balancer.release(instance, connect_failed=False)
             latency_ms = (time.monotonic() - start) * 1000
             await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=True)
             metrics.backend_timeouts_total.labels(name).inc()
@@ -154,9 +190,11 @@ class BackendDispatcher:
             # Connection refused/reset/etc. — a single unreachable backend
             # must surface as this path's own 502, not an unhandled 500
             # (FR-083a: a dead backend affects only its own path).
+            await self._load_balancer.release(instance, connect_failed=False)
             latency_ms = (time.monotonic() - start) * 1000
             await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=False)
             metrics.backend_errors_total.labels(name).inc()
+            metrics.backend_instance_errors_total.labels(name, instance.url).inc()
             metrics.backend_request_duration_seconds.labels(name, class_label).observe(
                 latency_ms / 1000
             )
@@ -173,9 +211,11 @@ class BackendDispatcher:
 
         latency_ms = (time.monotonic() - start) * 1000
         status_code = upstream_response.status_code
+        await self._load_balancer.release(instance, connect_failed=False)
         await controller.release(1, latency_ms=latency_ms, status_code=status_code, timed_out=False)
         if status_code >= 500:
             metrics.backend_errors_total.labels(name).inc()
+            metrics.backend_instance_errors_total.labels(name, instance.url).inc()
         metrics.backend_request_duration_seconds.labels(name, class_label).observe(
             latency_ms / 1000
         )

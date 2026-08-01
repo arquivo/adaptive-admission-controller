@@ -33,7 +33,9 @@ STREAM_CHUNK = b"0123456789abcdef" * 1024  # 16 KiB
 STREAM_CHUNK_COUNT = 640  # ~10 MiB total, enough to span many TCP segments
 
 
-async def _echo(request: Request) -> JSONResponse:
+async def _echo(request: Request, counter: dict[str, int] | None = None) -> JSONResponse:
+    if counter is not None:
+        counter["calls"] = counter.get("calls", 0) + 1
     body = await request.body()
     return JSONResponse(
         {
@@ -87,7 +89,9 @@ async def _fail(request: Request) -> JSONResponse:
     return JSONResponse({"error": "simulated backend failure"}, status_code=500)
 
 
-async def _dispatch_by_suffix(request: Request, slow_handler):
+async def _dispatch_by_suffix(
+    request: Request, slow_handler, counter: dict[str, int] | None = None
+):
     """The AAC forwards the original (unstripped) request path upstream, so
     the mock backend routes by *suffix* rather than by a fixed path — it
     doesn't know what prefix the AAC test config used."""
@@ -100,14 +104,14 @@ async def _dispatch_by_suffix(request: Request, slow_handler):
         return await slow_handler(request)
     if path.rstrip("/").endswith("/fail"):
         return await _fail(request)
-    return await _echo(request)
+    return await _echo(request, counter)
 
 
 def _mock_backend_app(concurrency: dict[str, int]) -> Starlette:
     slow_handler = _make_slow_handler(concurrency)
 
     async def _route(request: Request):
-        return await _dispatch_by_suffix(request, slow_handler)
+        return await _dispatch_by_suffix(request, slow_handler, concurrency)
 
     return Starlette(
         routes=[
@@ -217,7 +221,7 @@ def make_config(
             "backends": [
                 {
                     "name": "mock-backend",
-                    "upstream_url": upstream_url,
+                    "upstreams": [{"url": upstream_url}],
                     "match": {"path_prefix": path_prefix},
                     "controller": "fixed",
                     "concurrency_limit": concurrency_limit,
@@ -241,18 +245,22 @@ def make_multi_backend_config(
     list of plain dicts, needed for isolation tests that must prove one
     backend's saturation/adjustment doesn't affect a sibling backend.
 
-    Each dict requires `name`/`upstream_url`/`path_prefix` plus either
-    `concurrency_limit` (fixed controller, the default) or the full adaptive
-    field set (`controller: "adaptive"` + `min_concurrency`/
-    `initial_concurrency`/`max_concurrency`/`target_p95_ms`/
-    `timeout_rate_threshold`/`error_rate_threshold`). Queue/timeout fields
-    fall back to the same defaults as `make_config`.
+    Each dict requires `name`/`path_prefix` plus either `upstream_url` (single
+    instance) or `upstream_urls` (multi-instance list) — exactly one of the
+    two — and either `concurrency_limit` (fixed controller, the default) or
+    the full adaptive field set (`controller: "adaptive"` +
+    `min_concurrency`/`initial_concurrency`/`max_concurrency`/
+    `target_p95_ms`/`timeout_rate_threshold`/`error_rate_threshold`).
+    Queue/timeout fields fall back to the same defaults as `make_config`.
     """
     backend_configs = []
     for b in backends:
+        if ("upstream_url" in b) == ("upstream_urls" in b):
+            raise ValueError("exactly one of `upstream_url`/`upstream_urls` is required")
+        urls = b["upstream_urls"] if "upstream_urls" in b else [b["upstream_url"]]
         entry = {
             "name": b["name"],
-            "upstream_url": b["upstream_url"],
+            "upstreams": [{"url": url} for url in urls],
             "match": {"path_prefix": b["path_prefix"]},
             "connect_timeout_seconds": b.get("connect_timeout_seconds", 5),
             "backend_timeout_seconds": b.get("backend_timeout_seconds", 30),
@@ -260,6 +268,10 @@ def make_multi_backend_config(
             "queue_timeout_seconds": b.get("queue_timeout_seconds", 30),
             "controller": b.get("controller", "fixed"),
         }
+        if "sticky_sessions" in b:
+            entry["sticky_sessions"] = b["sticky_sessions"]
+        if "sticky_session_ttl_seconds" in b:
+            entry["sticky_session_ttl_seconds"] = b["sticky_session_ttl_seconds"]
         if entry["controller"] == "fixed":
             entry["concurrency_limit"] = b.get("concurrency_limit", 100)
         else:
