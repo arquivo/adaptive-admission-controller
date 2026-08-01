@@ -182,4 +182,36 @@ class ScoreEngine:
 
     async def score(self, ctx: RequestContext) -> int:
         config = self._configs[ctx.backend]
-        return await calculate_score(ctx, self._store, config)
+        try:
+            return await calculate_score(ctx, self._store, config)
+        except Exception:
+            # Redis-down fallback (`docs/decision_log.md` A5): admission must
+            # keep working with the in-process capacity limiters unaffected,
+            # so scoring degrades to "base score, zero penalties" rather than
+            # propagating the failure into a 500. `/readyz` is the intended
+            # signal for this condition (`app/health.py`), not the request
+            # path — so this only logs, it never raises further.
+            logger.warning(
+                "scoring_redis_unavailable",
+                extra={"backend": ctx.backend, "user_class": ctx.user_class},
+                exc_info=True,
+            )
+            return _fail_open_score(ctx, config)
+
+
+def _fail_open_score(ctx: RequestContext, config: ResolvedScoringConfig) -> int:
+    base = config.base_scores[ctx.user_class]
+    is_exempt = ctx.country in config.exempt_countries
+    final = _clamp(base, config.score_clamp.min_score, config.score_clamp.max_score)
+    ctx.score_breakdown = ScoreBreakdown(
+        base=base,
+        penalty_ip=0,
+        penalty_net24=0,
+        penalty_net6=0,
+        penalty_asn=0,
+        penalty_country=0,
+        penalty_user=0,
+        is_exempt=is_exempt,
+        final=final,
+    )
+    return final

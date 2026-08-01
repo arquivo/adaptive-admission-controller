@@ -4,7 +4,7 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 5 ("Full Observability") complete
+## Status: Phase 6 ("Integration and Hardening") complete for the codable subset
 
 The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
@@ -26,7 +26,17 @@ towards its configured maximum. Phase 5 completes observability: all 14 Promethe
 registered and updated live, every admission decision emits a structured JSON log line, an
 opt-in set of `X-AAC-*` diagnostic response headers can be enabled for interactive debugging, and
 a GET-only, bearer-token-authenticated `/admin/*` API exposes live backend policy/limit/queue
-state.
+state. Phase 6 hardens what's provable in this environment: multi-backend isolation, adaptive
+shrink under a real error burst, real queue-timeout `503`s, Redis-outage fail-open admission, and
+client-header/malformed-header abuse resistance are all covered by integration tests against the
+real-socket mock-backend harness (`tests/integration/test_hardening.py`), and
+`scripts/load_test.py` is a runnable async load-test tool. Phase 6's remaining items — routing
+real queries through the actual `page-search-api`/`image-search-api`/pywb backends, a genuine
+500-concurrent-client load test, and a real Prometheus alert firing on Redis loss — need real
+staging infrastructure this environment doesn't have, and are tracked as open in
+`docs/implementation_plan.md` §7 rather than claimed done.
+
+
 
 ## Backends
 
@@ -109,6 +119,17 @@ uv run ruff check .  # lint
 
 Integration tests spin up a real-socket mock upstream backend and drive the full app through
 `httpx.ASGITransport`.
+
+## Load testing
+
+`scripts/load_test.py` fires a configurable number of concurrent GET requests at a running AAC
+(or any HTTP endpoint) and reports latency p50/p95/p99 and the response status-code distribution
+— useful for a quick concurrency/backpressure smoke test against a local or staging deployment.
+
+```bash
+uv run python scripts/load_test.py --url http://localhost:8000/textsearch/ \
+    --concurrency 50 --requests 500
+```
 
 ## Endpoints
 

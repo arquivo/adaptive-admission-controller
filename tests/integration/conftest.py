@@ -83,6 +83,10 @@ def _make_slow_handler(concurrency: dict[str, int]):
     return _slow
 
 
+async def _fail(request: Request) -> JSONResponse:
+    return JSONResponse({"error": "simulated backend failure"}, status_code=500)
+
+
 async def _dispatch_by_suffix(request: Request, slow_handler):
     """The AAC forwards the original (unstripped) request path upstream, so
     the mock backend routes by *suffix* rather than by a fixed path — it
@@ -94,6 +98,8 @@ async def _dispatch_by_suffix(request: Request, slow_handler):
         return await _stream_up(request)
     if path.rstrip("/").endswith("/slow"):
         return await slow_handler(request)
+    if path.rstrip("/").endswith("/fail"):
+        return await _fail(request)
     return await _echo(request)
 
 
@@ -221,6 +227,66 @@ def make_config(
                     "queue_timeout_seconds": queue_timeout_seconds,
                 }
             ],
+        }
+    )
+
+
+def make_multi_backend_config(
+    backends: list[dict],
+    *,
+    trusted_proxies: list[str] | None = None,
+    debug_headers_enabled: bool = False,
+) -> AACConfig:
+    """Like `make_config`, but builds an arbitrary number of backends from a
+    list of plain dicts, needed for isolation tests that must prove one
+    backend's saturation/adjustment doesn't affect a sibling backend.
+
+    Each dict requires `name`/`upstream_url`/`path_prefix` plus either
+    `concurrency_limit` (fixed controller, the default) or the full adaptive
+    field set (`controller: "adaptive"` + `min_concurrency`/
+    `initial_concurrency`/`max_concurrency`/`target_p95_ms`/
+    `timeout_rate_threshold`/`error_rate_threshold`). Queue/timeout fields
+    fall back to the same defaults as `make_config`.
+    """
+    backend_configs = []
+    for b in backends:
+        entry = {
+            "name": b["name"],
+            "upstream_url": b["upstream_url"],
+            "match": {"path_prefix": b["path_prefix"]},
+            "connect_timeout_seconds": b.get("connect_timeout_seconds", 5),
+            "backend_timeout_seconds": b.get("backend_timeout_seconds", 30),
+            "queue_max_size": b.get("queue_max_size", 100),
+            "queue_timeout_seconds": b.get("queue_timeout_seconds", 30),
+            "controller": b.get("controller", "fixed"),
+        }
+        if entry["controller"] == "fixed":
+            entry["concurrency_limit"] = b.get("concurrency_limit", 100)
+        else:
+            for field in (
+                "min_concurrency",
+                "initial_concurrency",
+                "max_concurrency",
+                "target_p95_ms",
+                "timeout_rate_threshold",
+                "error_rate_threshold",
+            ):
+                entry[field] = b[field]
+        backend_configs.append(entry)
+
+    return AACConfig.model_validate(
+        {
+            "ingress": {
+                "trusted_proxies": trusted_proxies or ["127.0.0.1"],
+                "xff_trusted_hops": 1,
+            },
+            "geoip": {
+                "city_db_path": "/nonexistent/GeoLite2-City.mmdb",
+                "asn_db_path": "/nonexistent/GeoLite2-ASN.mmdb",
+            },
+            "observability": {"debug_headers": {"enabled": debug_headers_enabled}},
+            "scoring": copy.deepcopy(_MINIMAL_SCORING),
+            "backends": backend_configs,
         }
     )
 

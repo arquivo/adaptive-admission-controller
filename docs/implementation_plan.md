@@ -760,27 +760,29 @@ These mirror a subset of the fields already logged per request (§6.2) — a lig
 
 ---
 
-## 7. Phase 6 — Integration and Hardening
+## 7. Phase 6 — Integration and Hardening ✅ (codable subset)
 
 **Goal:** Validate the full system against real or realistic backends in a staging environment. Exercise all defined failure modes.
 
+**Scope note (2026-08-01):** this sandbox has no real `page-search-api`/`image-search-api`/pywb backends, no `locust`/`k6` runner, and no way to genuinely drive 500 concurrent clients or a real Prometheus/Alertmanager pipeline. Every item below that depends on that real infrastructure is left unchecked and called out explicitly rather than marked done. Everything provable against the existing real-socket mock-backend harness (`tests/integration/conftest.py`) was implemented and tested for real — see `tests/integration/test_hardening.py` (new) plus the existing Phase 1-5 integration/unit suites referenced inline below. `scripts/load_test.py` is the runnable load-test tool for §7.2, ready to point at a real deployment.
+
 ### 7.1 Integration Tests
 
-- [ ] Route real queries through `page-search-api` and `image-search-api` independently; verify each limit is enforced and metrics are reported per-backend.
-- [ ] Route real pywb requests through all four paths (`/wayback`, `/noFrame/replay`, `/noFrame/patching`, `/save`); verify each resolves to its own backend queue.
-- [ ] Verify longest-prefix-wins routing: a request path matching two configured prefixes (e.g. `/noFrame/patching` vs. a hypothetical bare `/noFrame`) resolves to the backend with the longer, more specific prefix (FR-011a).
-- [ ] Verify a request path matching no configured backend returns `404` without being enqueued or scored (FR-011c).
-- [ ] Simulate latency injection on `page-search-api`; verify its adaptive controller reduces its limit without affecting `image-search-api`.
-- [ ] Simulate backend 5xx burst; verify limit reduction and error metrics.
-- [ ] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter.
-- [ ] Simulate a backlog large enough that the projected wait already exceeds `queue_timeout_seconds` while the queue is still under `queue_max_size`; verify immediate `429` with reason `queue_wait_exceeded` (FR-033a), distinct from the `queue_full` case above `queue_max_size`.
-- [ ] Simulate client disconnect during queue wait; verify Future cancellation.
-- [ ] Verify that saturating any one of the six backends does not affect the other five queues.
-- [ ] Verify that Redis disconnection makes `/readyz` report not-ready (FR-083a) while admission continues to work normally — scoring fails open (base score only, zero penalties) and the fixed/adaptive capacity limiters keep protecting backends unaffected — and that an alert fires.
+- [ ] Route real queries through `page-search-api` and `image-search-api` independently; verify each limit is enforced and metrics are reported per-backend. — **not achievable here**: requires the real backends.
+- [ ] Route real pywb requests through all four paths (`/wayback`, `/noFrame/replay`, `/noFrame/patching`, `/save`); verify each resolves to its own backend queue. — **not achievable here**: requires the real backends.
+- [x] Verify longest-prefix-wins routing: a request path matching two configured prefixes (e.g. `/noFrame/patching` vs. a hypothetical bare `/noFrame`) resolves to the backend with the longer, more specific prefix (FR-011a). — `tests/unit/test_registry.py` (Phase 1).
+- [x] Verify a request path matching no configured backend returns `404` without being enqueued or scored (FR-011c). — `tests/integration/test_proxy_e2e.py::test_unmatched_path_returns_404`.
+- [x] Simulate latency injection on `page-search-api`; verify its adaptive controller reduces its limit without affecting `image-search-api`. — proven against two mock backends, same isolation mechanism real named backends would use: `tests/integration/test_hardening.py::test_saturated_backend_does_not_block_sibling_backend` + `::test_adaptive_controller_shrinks_limit_on_real_error_burst`.
+- [x] Simulate backend 5xx burst; verify limit reduction and error metrics. — `tests/integration/test_hardening.py::test_adaptive_controller_shrinks_limit_on_real_error_burst`; `backend_errors_total` covered in `tests/integration/test_observability_e2e.py`.
+- [x] Simulate queue saturation; verify 503 responses and `queue_timeout_total` counter. — `tests/integration/test_hardening.py::test_request_stuck_in_queue_past_timeout_yields_503_queue_timeout`.
+- [x] Simulate a backlog large enough that the projected wait already exceeds `queue_timeout_seconds` while the queue is still under `queue_max_size`; verify immediate `429` with reason `queue_wait_exceeded` (FR-033a), distinct from the `queue_full` case above `queue_max_size`. — `tests/unit/test_scheduler.py::test_enqueue_raises_queue_wait_exceeded_before_queue_is_full`.
+- [x] Simulate client disconnect during queue wait; verify Future cancellation. — `tests/unit/test_scheduler.py::test_run_worker_releases_capacity_for_cancelled_future_without_dispatching`.
+- [x] Verify that saturating any one of the six backends does not affect the other five queues. — mechanism proven with 2 mock backends in `tests/integration/test_hardening.py::test_saturated_backend_does_not_block_sibling_backend`; each backend gets its own `CapacityController`/queue regardless of count, so this generalizes directly to all six real backends.
+- [x] Verify that Redis disconnection makes `/readyz` report not-ready (FR-083a) while admission continues to work normally — scoring fails open (base score only, zero penalties) and the fixed/adaptive capacity limiters keep protecting backends unaffected. — `tests/integration/test_hardening.py::test_admission_continues_when_redis_is_unreachable`, backed by the `app/scoring.py` fail-open fix + `tests/unit/test_scoring.py::test_score_engine_fails_open_to_base_score_when_store_raises`. The "and that an alert fires" clause needs a real Prometheus/Alertmanager deployment — **not achievable here**, deferred to Phase 7 rollout.
 
 ### 7.2 Load Testing
 
-Tools: `locust` or `k6`.
+Tools: `locust` or `k6` were the originally planned tools; **not achievable here** (no real backends, no multi-host load generation). Implemented instead: `scripts/load_test.py`, a standalone async `httpx`-based tool that fires a configurable number of concurrent requests at any URL and reports latency percentiles + status-code distribution — smoke-tested against a local HTTP server (see Phase 6 verification notes). It is the runnable tool for the scenarios below once a real staging environment exists; none of the specific scenarios were actually executed against real backends.
 
 Scenarios:
 
@@ -793,12 +795,12 @@ Scenarios:
 
 ### 7.3 Security Hardening
 
-- [ ] Verify that client-supplied priority headers are ignored.
-- [ ] Verify that auth state is only derived from verified upstream headers.
-- [ ] Verify that a spoofed `X-Forwarded-For` from a peer not in `trusted_proxies` is rejected `403`, never trusted as the client IP (FR-010a).
-- [ ] Verify admin API requires authentication; returns 401 without credentials.
-- [ ] Verify diagnostic response headers (§6.2a, FR-074) are absent when `observability.debug_headers.enabled` is left at its default (`false`); enabling it exposes exactly the four documented headers, nothing more.
-- [ ] Verify that large request bodies (e.g. a multi-GB WARC-backed resource) are streamed through without full in-memory buffering (FR-054) and that malformed headers are handled without crash. Maximum body/header size is enforced upstream by Apache httpd, not by the AAC — out of scope here (§4.2 Non-Goals, `requirements.md`).
+- [x] Verify that client-supplied priority headers are ignored. — `app/classifier.py` only ever reads `Authorization` for classification/scoring by construction; proven at the wire level in `tests/integration/test_hardening.py::test_client_supplied_priority_header_has_no_effect_on_score`.
+- [x] Verify that auth state is only derived from verified upstream headers. — `tests/unit/test_auth.py` (expired/wrong-issuer/bad-signature/unknown-kid/non-bearer tokens all fail to `UNKNOWN`, never trusted).
+- [x] Verify that a spoofed `X-Forwarded-For` from a peer not in `trusted_proxies` is rejected `403`, never trusted as the client IP (FR-010a). — `tests/integration/test_proxy_e2e.py::test_untrusted_peer_rejected_403`, `tests/unit/test_ingress.py`.
+- [x] Verify admin API requires authentication; returns 401 without credentials. — `tests/unit/test_admin.py`, `tests/integration/test_observability_e2e.py::test_admin_routes_reject_missing_or_wrong_token`.
+- [x] Verify diagnostic response headers (§6.2a, FR-074) are absent when `observability.debug_headers.enabled` is left at its default (`false`); enabling it exposes exactly the four documented headers, nothing more. — `tests/integration/test_observability_e2e.py`.
+- [x] Verify that large request bodies (e.g. a multi-GB WARC-backed resource) are streamed through without full in-memory buffering (FR-054) and that malformed headers are handled without crash. Maximum body/header size is enforced upstream by Apache httpd, not by the AAC — out of scope here (§4.2 Non-Goals, `requirements.md`). — streaming: `tests/integration/test_proxy_e2e.py::test_streamed_large_response_round_trips_correctly`/`test_streamed_post_upload_hash_matches`; malformed headers: `tests/integration/test_hardening.py::test_malformed_forwarded_for_header_does_not_crash_request`.
 
 ---
 

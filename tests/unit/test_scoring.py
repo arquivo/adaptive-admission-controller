@@ -183,3 +183,31 @@ async def test_score_engine_dispatches_by_backend():
     score = await engine.score(ctx)
 
     assert score == 100
+
+
+class _UnreachablePenaltyStore(FakePenaltyStore):
+    """Simulates a Redis outage: any counter operation raises."""
+
+    async def increment_and_get(self, key: str, ttl_seconds: int) -> int:
+        raise ConnectionError("redis unreachable")
+
+
+async def test_score_engine_fails_open_to_base_score_when_store_raises():
+    """`docs/decision_log.md` A5: Redis loss must not crash the request —
+    scoring degrades to base score, zero penalties, admission keeps working."""
+    config = _resolved_config(ip=[_window(soft_threshold=1, hard_threshold=1)])
+    store = _UnreachablePenaltyStore()
+    engine = ScoreEngine(store, {"test-backend": config})
+    ctx = _ctx()
+
+    score = await engine.score(ctx)
+
+    assert score == 100  # base, no penalties applied despite the hard-threshold window
+    breakdown = ctx.score_breakdown
+    assert breakdown.penalty_ip == 0
+    assert breakdown.penalty_net24 == 0
+    assert breakdown.penalty_net6 == 0
+    assert breakdown.penalty_asn == 0
+    assert breakdown.penalty_country == 0
+    assert breakdown.penalty_user == 0
+    assert breakdown.final == 100
