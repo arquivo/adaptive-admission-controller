@@ -530,19 +530,19 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 
 ### 4.5 Tasks
 
-- [ ] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
-- [ ] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the local database file at `geoip.db_path` (§2.3, FR-013a) with a local TTL cache; the running AAC process never fetches this file itself.
-- [ ] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads the latest MaxMind GeoLite2 database and writes it to `geoip.db_path`; the AAC only picks up a refreshed database on its next restart (FR-013a).
-- [ ] Implement `ScoreEngine` against the `PenaltyStore` interface (§2.2) — never a direct Redis client — backed by `RedisPenaltyStore` (async `INCR`+`EXPIRE`), the sole production implementation (`docs/decision_log.md` D3).
-- [ ] (tests only) Implement an in-memory `FakePenaltyStore` for unit tests — not a supported deployment configuration; never referenced from `config/backends.yaml` or environment-variable wiring.
-- [ ] Implement penalty functions per dimension, each taking its resolved list of `PenaltyConfig` windows (one or more per dimension — `user` has two, §2.3/§4.2) and summing the per-window soft/hard results, rather than hardcoded constants.
-- [ ] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
-- [ ] Log full score decomposition as structured JSON per request.
-- [ ] Unit tests: classification rules, penalty calculation, score clamping.
-- [ ] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
-- [ ] Unit tests: `page-search-api`/`image-search-api` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
-- [ ] Unit tests: the `user` dimension sums penalties across its 60s and 3600s windows independently (e.g. hard on the burst window + soft on the sustained window ⇒ both penalties applied).
-- [ ] Integration tests: verify score reflects correct Redis counter state.
+- [x] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
+- [x] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the local database file at `geoip.db_path` (§2.3, FR-013a) with a local TTL cache; the running AAC process never fetches this file itself.
+- [ ] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads the latest MaxMind GeoLite2 database and writes it to `geoip.db_path`; the AAC only picks up a refreshed database on its next restart (FR-013a). Deferred: the stub's `NotImplementedError` is untouched pending the MaxMind account/license-key decision (`docs/open_tbd.md`).
+- [x] Implement `ScoreEngine` against the `PenaltyStore` interface (§2.2) — never a direct Redis client — backed by `RedisPenaltyStore` (async `INCR`+`EXPIRE`), the sole production implementation (`docs/decision_log.md` D3).
+- [x] (tests only) Implement an in-memory `FakePenaltyStore` for unit tests — not a supported deployment configuration; never referenced from `config/backends.yaml` or environment-variable wiring.
+- [x] Implement penalty functions per dimension, each taking its resolved list of `PenaltyConfig` windows (one or more per dimension — `user` has two, §2.3/§4.2) and summing the per-window soft/hard results, rather than hardcoded constants.
+- [x] Implement exempt-country logic: skip net24/net6/asn/country penalty contribution when `ctx.country` is in `config.exempt_countries`, while still incrementing the underlying Redis counters and logging a `country_exempt` flag.
+- [x] Log full score decomposition as structured JSON per request.
+- [x] Unit tests: classification rules, penalty calculation, score clamping.
+- [x] Unit tests: exempt-country requests skip net24/asn/country penalties but still receive ip/user penalties.
+- [x] Unit tests: `page-search-api`/`image-search-api` use their overridden `ip` penalty thresholds; other backends use the global default unchanged.
+- [x] Unit tests: the `user` dimension sums penalties across its 60s and 3600s windows independently (e.g. hard on the burst window + soft on the sustained window ⇒ both penalties applied).
+- [x] Integration tests: verify score reflects correct Redis counter state.
 
 ---
 
