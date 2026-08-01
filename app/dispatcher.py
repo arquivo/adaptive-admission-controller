@@ -5,11 +5,20 @@ upstream and streams the response back, without full in-memory buffering
 
 from __future__ import annotations
 
+import time
+from typing import TYPE_CHECKING
+
 import httpx
-from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from app.config import BackendConfig
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from starlette.requests import Request
+
+    from app.interfaces import CapacityController, RequestContext
 
 # Headers that are connection-specific and must never be forwarded verbatim
 # in either direction (RFC 7230 §6.1 plus Host, which must be recomputed by
@@ -54,7 +63,11 @@ class BackendDispatcher:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def dispatch(self, request: Request) -> Response:
+    async def _send_and_stream(self, request: Request) -> tuple[httpx.Response, Response]:
+        """Sends `request` upstream and returns both the raw `httpx.Response`
+        (for status/latency bookkeeping) and the `StreamingResponse` wrapping
+        its body. Raises `httpx.HTTPError` (including `httpx.TimeoutException`)
+        on connect/send failure — callers decide the resulting status code."""
         # `match.path_prefix` is used only for backend *selection* (see
         # app.registry) — the original path is forwarded unchanged, matching
         # a drop-in replacement for Apache's ProxyPass.
@@ -68,13 +81,7 @@ class BackendDispatcher:
             headers=_strip_hop_by_hop(request.headers),
             content=request.stream(),
         )
-        try:
-            upstream_response = await self._client.send(upstream_request, stream=True)
-        except httpx.HTTPError:
-            # Connection refused/timed out/etc. — a single unreachable
-            # backend must surface as this path's own 502, not an unhandled
-            # 500 (FR-083a: a dead backend affects only its own path).
-            return JSONResponse({"detail": "bad gateway"}, status_code=502)
+        upstream_response = await self._client.send(upstream_request, stream=True)
 
         async def body():
             try:
@@ -93,4 +100,53 @@ class BackendDispatcher:
             (k.encode("latin-1"), v.encode("latin-1"))
             for k, v in _strip_hop_by_hop(upstream_response.headers)
         ]
-        return response
+        return upstream_response, response
+
+    async def dispatch_queued(
+        self,
+        request: Request,
+        ctx: RequestContext,
+        future: asyncio.Future,
+        controller: CapacityController,
+    ) -> None:
+        """Run by `PriorityScheduler.run_worker()` from a detached task once
+        a capacity slot has been acquired for this request. Always releases
+        the slot (FR-052: immediately on response or timeout) and resolves
+        `future` with the final `Response` — unless `future` was already
+        cancelled (the original request gave up first), in which case any
+        already-open upstream response is closed directly instead."""
+        start = time.monotonic()
+        try:
+            upstream_response, response = await self._send_and_stream(request)
+        except httpx.TimeoutException:
+            latency_ms = (time.monotonic() - start) * 1000
+            await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=True)
+            if not future.cancelled():
+                future.set_result(
+                    JSONResponse(
+                        {"detail": "gateway timeout", "reason": "backend_timeout"},
+                        status_code=503,
+                    )
+                )
+            return
+        except httpx.HTTPError:
+            # Connection refused/reset/etc. — a single unreachable backend
+            # must surface as this path's own 502, not an unhandled 500
+            # (FR-083a: a dead backend affects only its own path).
+            latency_ms = (time.monotonic() - start) * 1000
+            await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=False)
+            if not future.cancelled():
+                future.set_result(JSONResponse({"detail": "bad gateway"}, status_code=502))
+            return
+
+        latency_ms = (time.monotonic() - start) * 1000
+        await controller.release(
+            1, latency_ms=latency_ms, status_code=upstream_response.status_code, timed_out=False
+        )
+
+        if future.cancelled():
+            # Nobody will ever consume `response`'s body stream.
+            await upstream_response.aclose()
+            return
+        future.set_result(response)
+

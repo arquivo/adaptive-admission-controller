@@ -7,6 +7,7 @@ mock upstream backend (see `conftest.py`).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import fakeredis
@@ -169,3 +170,57 @@ async def test_readyz_not_ready_when_redis_unreachable(mock_backend, monkeypatch
 
     assert response.status_code == 503
     assert response.json()["reason"] == "redis_unreachable"
+
+
+async def test_burst_beyond_queue_capacity_yields_queue_full_429(
+    mock_backend_with_concurrency_counter,
+):
+    """Regression check for the historical over-admission bug: with
+    `concurrency_limit=1` and `queue_max_size=1`, only one request can be
+    in flight and one more queued — everything beyond that must be rejected
+    with 429/queue_full rather than silently admitted."""
+    upstream_url, _counter = mock_backend_with_concurrency_counter
+    config = make_config(
+        upstream_url,
+        concurrency_limit=1,
+        queue_max_size=1,
+        queue_timeout_seconds=30,
+    )
+    burst_size = 10
+
+    async with running_app(config) as (_app, client):
+        responses = await asyncio.gather(
+            *(client.get("/proxytest/slow?delay=0.3") for _ in range(burst_size))
+        )
+
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(200) < burst_size
+    rejected = [r for r in responses if r.status_code == 429]
+    assert rejected
+    assert all(r.json()["reason"] == "queue_full" for r in rejected)
+    assert set(statuses) <= {200, 429}
+
+
+async def test_concurrency_limit_of_one_genuinely_serializes_dispatch(
+    mock_backend_with_concurrency_counter,
+):
+    """Proves the capacity gate actually blocks dispatch rather than just
+    delaying it: with `concurrency_limit=1`, the upstream must never observe
+    more than one of these requests in flight at the same time, even though
+    they're all fired concurrently."""
+    upstream_url, counter = mock_backend_with_concurrency_counter
+    config = make_config(
+        upstream_url,
+        concurrency_limit=1,
+        queue_max_size=10,
+        queue_timeout_seconds=30,
+    )
+    burst_size = 5
+
+    async with running_app(config) as (_app, client):
+        responses = await asyncio.gather(
+            *(client.get("/proxytest/slow?delay=0.1") for _ in range(burst_size))
+        )
+
+    assert all(r.status_code == 200 for r in responses)
+    assert counter["max"] == 1

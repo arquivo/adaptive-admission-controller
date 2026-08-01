@@ -61,7 +61,27 @@ async def _stream_up(request: Request) -> JSONResponse:
     return JSONResponse({"sha256": hasher.hexdigest(), "byte_count": total})
 
 
-async def _dispatch_by_suffix(request: Request):
+def _make_slow_handler(concurrency: dict[str, int]):
+    """`concurrency` is a shared mutable counter (`{"current": ..., "max":
+    ...}`) so tests can assert on peak in-flight overlap at the *upstream*,
+    independently of what the AAC observed — the only way to prove the AAC's
+    capacity gate genuinely serializes dispatch rather than just delaying it.
+    """
+
+    async def _slow(request: Request) -> JSONResponse:
+        delay_seconds = float(request.query_params.get("delay", "0.2"))
+        concurrency["current"] += 1
+        concurrency["max"] = max(concurrency["max"], concurrency["current"])
+        try:
+            await asyncio.sleep(delay_seconds)
+        finally:
+            concurrency["current"] -= 1
+        return JSONResponse({"ok": True})
+
+    return _slow
+
+
+async def _dispatch_by_suffix(request: Request, slow_handler):
     """The AAC forwards the original (unstripped) request path upstream, so
     the mock backend routes by *suffix* rather than by a fixed path — it
     doesn't know what prefix the AAC test config used."""
@@ -70,15 +90,22 @@ async def _dispatch_by_suffix(request: Request):
         return await _stream_down(request)
     if path.rstrip("/").endswith("/upload"):
         return await _stream_up(request)
+    if path.rstrip("/").endswith("/slow"):
+        return await slow_handler(request)
     return await _echo(request)
 
 
-def _mock_backend_app() -> Starlette:
+def _mock_backend_app(concurrency: dict[str, int]) -> Starlette:
+    slow_handler = _make_slow_handler(concurrency)
+
+    async def _route(request: Request):
+        return await _dispatch_by_suffix(request, slow_handler)
+
     return Starlette(
         routes=[
             Route(
                 "/{path:path}",
-                _dispatch_by_suffix,
+                _route,
                 methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
             ),
         ]
@@ -91,11 +118,11 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest_asyncio.fixture
-async def mock_backend():
+@asynccontextmanager
+async def _running_mock_backend(concurrency: dict[str, int]):
     port = _free_port()
     config = uvicorn.Config(
-        _mock_backend_app(), host="127.0.0.1", port=port, log_level="warning"
+        _mock_backend_app(concurrency), host="127.0.0.1", port=port, log_level="warning"
     )
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve())
@@ -108,6 +135,22 @@ async def mock_backend():
     finally:
         server.should_exit = True
         await task
+
+
+@pytest_asyncio.fixture
+async def mock_backend():
+    async with _running_mock_backend({"current": 0, "max": 0}) as url:
+        yield url
+
+
+@pytest_asyncio.fixture
+async def mock_backend_with_concurrency_counter():
+    """Like `mock_backend`, but also exposes the `/slow` route's shared
+    concurrency counter dict, for tests that assert on peak upstream overlap
+    (`counter["max"]`)."""
+    concurrency = {"current": 0, "max": 0}
+    async with _running_mock_backend(concurrency) as url:
+        yield url, concurrency
 
 
 @pytest.fixture
@@ -144,6 +187,9 @@ def make_config(
     *,
     path_prefix: str = "/proxytest",
     trusted_proxies: list[str] | None = None,
+    concurrency_limit: int = 100,
+    queue_max_size: int = 100,
+    queue_timeout_seconds: float = 30,
 ) -> AACConfig:
     """A minimal single-backend `AACConfig` pointed at a real (mock) upstream,
     for driving the proxy round trip end to end."""
@@ -161,11 +207,11 @@ def make_config(
                     "upstream_url": upstream_url,
                     "match": {"path_prefix": path_prefix},
                     "controller": "fixed",
-                    "concurrency_limit": 100,
+                    "concurrency_limit": concurrency_limit,
                     "connect_timeout_seconds": 5,
                     "backend_timeout_seconds": 30,
-                    "queue_max_size": 100,
-                    "queue_timeout_seconds": 30,
+                    "queue_max_size": queue_max_size,
+                    "queue_timeout_seconds": queue_timeout_seconds,
                 }
             ],
         }

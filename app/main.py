@@ -1,13 +1,17 @@
 """FastAPI app factory + lifespan.
 
-Phase 1's request lifecycle, precisely: TrustedProxyMiddleware (403, or set
+Phase 2's request lifecycle: TrustedProxyMiddleware (403, or set
 `request.state.client_ip`) -> registry.match() (404 on miss, FR-011c) ->
-dispatcher.dispatch() awaited directly inline in the handler coroutine. No
-queueing, no capacity gating, no scoring — those are Phase 2/3.
+classify() -> scheduler.enqueue() (429 on QueueFullError/QueueWaitExceededError)
+-> await the resulting Future, bounded by queue_timeout_seconds (503 on
+timeout) -> the Response a background worker resolved it with. Scoring isn't
+wired in yet (Phase 3) — every request currently gets `RequestContext.score`'s
+fixed default.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -17,12 +21,15 @@ from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from app.capacity import FixedController
 from app.config import AACConfig, Settings, load_config
 from app.dispatcher import BackendDispatcher
+from app.errors import QueueFullError, QueueWaitExceededError
 from app.health import routes as health_routes
 from app.ingress import TrustedProxyMiddleware
 from app.metrics import routes as metrics_routes
 from app.registry import BackendPolicyRegistry
+from app.scheduler import PriorityScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +56,40 @@ def _build_lifespan(preloaded_config: AACConfig | None):
         app.state.dispatchers = {
             backend.name: BackendDispatcher(backend) for backend in config.backends
         }
+        app.state.controllers = {}
+        app.state.schedulers = {}
+        worker_tasks = []
+        for backend in config.backends:
+            # Phase 2 only implements the fixed controller. `adaptive`
+            # backends get a temporary non-adapting FixedController sized at
+            # initial_concurrency, so the queue/capacity pipeline is uniform
+            # across all backends (FR-047) — Phase 4 replaces this stand-in
+            # with real adaptive concurrency adjustment.
+            limit = (
+                backend.concurrency_limit
+                if backend.controller == "fixed"
+                else backend.initial_concurrency
+            )
+            controller = FixedController(limit)
+            scheduler = PriorityScheduler(
+                backend.queue_max_size, backend.queue_timeout_seconds, controller
+            )
+            app.state.controllers[backend.name] = controller
+            app.state.schedulers[backend.name] = scheduler
+            worker_tasks.append(
+                asyncio.create_task(
+                    scheduler.run_worker(controller, app.state.dispatchers[backend.name])
+                )
+            )
         app.state.redis = redis_asyncio.from_url(settings.redis_url)
         app.state.ready = True
 
         try:
             yield
         finally:
+            for task in worker_tasks:
+                task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
             await app.state.redis.aclose()
             for dispatcher in app.state.dispatchers.values():
                 await dispatcher.aclose()
@@ -67,8 +102,27 @@ async def proxy_handler(request: Request):
     if policy is None:
         return JSONResponse({"detail": "not found"}, status_code=404)  # FR-011c
 
-    dispatcher = request.app.state.dispatchers[policy.config.name]
-    return await dispatcher.dispatch(request)
+    backend_name = policy.config.name
+    ctx = policy.classify(request)
+    scheduler = request.app.state.schedulers[backend_name]
+
+    try:
+        future = await scheduler.enqueue(request, ctx)
+    except QueueWaitExceededError:
+        return JSONResponse(
+            {"detail": "too many requests", "reason": "queue_wait_exceeded"}, status_code=429
+        )
+    except QueueFullError:
+        return JSONResponse(
+            {"detail": "too many requests", "reason": "queue_full"}, status_code=429
+        )
+
+    try:
+        return await asyncio.wait_for(future, timeout=policy.config.queue_timeout_seconds)
+    except TimeoutError:
+        return JSONResponse(
+            {"detail": "service unavailable", "reason": "queue_timeout"}, status_code=503
+        )
 
 
 def create_app(config: AACConfig | None = None) -> FastAPI:

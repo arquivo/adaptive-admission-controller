@@ -66,10 +66,18 @@ class CapacityController(ABC):
 
 class Scheduler(ABC):
     @abstractmethod
-    async def enqueue(self, request_context: RequestContext) -> asyncio.Future: ...
+    async def enqueue(self, request: Request, request_context: RequestContext) -> asyncio.Future:
+        """Enqueues `request`/`request_context` together, so the eventual
+        worker can dispatch the real request (streaming body included)
+        rather than just the scheduling metadata in `RequestContext`."""
+        ...
 
     @abstractmethod
-    async def next_request(self, backend_name: str) -> RequestContext: ...
+    async def run_worker(self, controller: CapacityController, dispatcher: Any) -> None:
+        """Runs forever: acquire a capacity slot, pop the next queued
+        request, dispatch it. `dispatcher` is untyped here (`Any`) to avoid
+        a circular import with `app.dispatcher`."""
+        ...
 
 
 class BackendPolicy(ABC):
