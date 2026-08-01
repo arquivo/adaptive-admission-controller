@@ -72,6 +72,24 @@ docker compose up --build
 Starts the AAC and a Redis instance. Real backend containers aren't part of this compose file
 yet (Phase 6) — point `config/backends.yaml` at reachable backends, or expect `502`s.
 
+## GeoIP/ASN database refresh
+
+The AAC reads two local MaxMind GeoLite2 files at startup — `geoip.city_db_path` and
+`geoip.asn_db_path` (`config/backends.yaml`) — and never downloads either itself; a missing or
+corrupt file fails open (that half of country/ASN lookups just returns `None`). Refreshing a file
+is a separate, explicit action via `scripts/update_geoip_db.py`, run manually or by deployment
+automation, never by the AAC process. It downloads one MaxMind edition per invocation from
+MaxMind's direct download API, authenticating via HTTP Basic Auth using account credentials from
+the `MAXMIND_ACCOUNT_ID`/`MAXMIND_LICENSE_KEY` environment variables (a free MaxMind account is
+required — see <https://dev.maxmind.com/geoip/updating-databases>). The AAC only picks up a
+refreshed file on its next restart.
+
+```bash
+export MAXMIND_ACCOUNT_ID=... MAXMIND_LICENSE_KEY=...
+uv run python scripts/update_geoip_db.py --edition GeoLite2-City --dest-path /var/lib/aac/GeoLite2-City.mmdb
+uv run python scripts/update_geoip_db.py --edition GeoLite2-ASN --dest-path /var/lib/aac/GeoLite2-ASN.mmdb
+```
+
 ## Testing
 
 ```bash

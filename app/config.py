@@ -59,7 +59,8 @@ class IngressConfig(BaseModel):
 
 
 class GeoIPConfig(BaseModel):
-    db_path: Path
+    city_db_path: Path
+    asn_db_path: Path
 
 
 class AuthConfig(BaseModel):

@@ -9,7 +9,10 @@ _BASE_CONFIG: dict = {
         "trusted_proxies": ["127.0.0.1", "::1"],
         "xff_trusted_hops": 1,
     },
-    "geoip": {"db_path": "/var/lib/aac/GeoLite2-City.mmdb"},
+    "geoip": {
+        "city_db_path": "/var/lib/aac/GeoLite2-City.mmdb",
+        "asn_db_path": "/var/lib/aac/GeoLite2-ASN.mmdb",
+    },
     "observability": {"debug_headers": {"enabled": False}},
     "scoring": {
         "exempt_countries": ["PT"],

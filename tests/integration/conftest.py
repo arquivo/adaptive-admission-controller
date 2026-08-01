@@ -201,7 +201,10 @@ def make_config(
                 "trusted_proxies": trusted_proxies or ["127.0.0.1"],
                 "xff_trusted_hops": 1,
             },
-            "geoip": {"db_path": "/nonexistent/GeoLite2-City.mmdb"},
+            "geoip": {
+                "city_db_path": "/nonexistent/GeoLite2-City.mmdb",
+                "asn_db_path": "/nonexistent/GeoLite2-ASN.mmdb",
+            },
             "scoring": copy.deepcopy(_MINIMAL_SCORING),
             "backends": [
                 {

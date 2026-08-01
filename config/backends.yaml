@@ -17,9 +17,15 @@ ingress:
   xff_trusted_hops: 1
 
 geoip:
-  # Local MaxMind GeoLite2 file the AAC reads at startup for ASN/country
-  # lookups (FR-013, FR-013a). Placeholder path — see docs/open_tbd.md.
-  db_path: /var/lib/aac/GeoLite2-City.mmdb
+  # Local MaxMind GeoLite2 files the AAC reads at startup for country/ASN
+  # lookups (FR-013, FR-013a). Two separate files — MaxMind's free tier has
+  # no combined country+ASN database. Refreshed independently via
+  # `scripts/update_geoip_db.py --edition <GeoLite2-City|GeoLite2-ASN>
+  # --dest-path <path>` (never invoked by the AAC process itself); the AAC
+  # only picks up a refreshed file on its next restart. Placeholder paths —
+  # see docs/open_tbd.md.
+  city_db_path: /var/lib/aac/GeoLite2-City.mmdb
+  asn_db_path: /var/lib/aac/GeoLite2-ASN.mmdb
 
 auth:
   # Keycloak JWT verification (FR-012) — purely a scoring/priority input, a

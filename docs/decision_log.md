@@ -444,6 +444,24 @@ download command is explicitly out of scope for these docs (a
 deployment-process detail — noted in `requirements.md` §11 and
 `implementation_plan.md` §8.1).
 
+**Addendum (2026-08-01):** `scripts/update_geoip_db.py` is now implemented for
+real. It surfaced a gap in the design above: MaxMind's free GeoLite2 tier
+ships country data (`GeoLite2-City`) and ASN data (`GeoLite2-ASN`) as two
+separate files — there is no free combined country+ASN database — so
+`geoip.db_path` is now two fields, `geoip.city_db_path` and
+`geoip.asn_db_path` (`config/backends.yaml`, `app/config.py`), and
+`GeoIPLookup` opens two independent readers, each failing open on its own
+(FR-013a amended accordingly). The refresh command downloads one edition per
+invocation (`--edition {GeoLite2-City,GeoLite2-ASN} --dest-path PATH`) from
+MaxMind's direct HTTP download API, authenticating via HTTP Basic Auth with
+credentials from the `MAXMIND_ACCOUNT_ID`/`MAXMIND_LICENSE_KEY` environment
+variables (no `AAC_` prefix — these are MaxMind's own credentials, not AAC
+settings). MaxMind's API documents no checksum-verification endpoint, so the
+downloaded file is instead validated by opening it with
+`maxminddb.open_database()` and checking its `metadata().database_type`
+matches the requested `--edition`; the file is written to `--dest-path` via
+an atomic same-directory temp-file + `os.replace()`.
+
 ### C7 — Exempt traffic metric label (Low)
 §14 risk mitigation claims exempt traffic is "metered separately" for anomaly
 review, but only the log carries `country_exempt`; metrics don't. Add an

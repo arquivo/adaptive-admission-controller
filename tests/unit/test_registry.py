@@ -7,7 +7,7 @@ from app.registry import BackendPolicyRegistry, _prefix_matches
 
 
 def _registry(config: AACConfig) -> BackendPolicyRegistry:
-    geoip = GeoIPLookup(config.geoip.db_path)
+    geoip = GeoIPLookup(config.geoip.city_db_path, config.geoip.asn_db_path)
     return BackendPolicyRegistry(config, geoip, JWTVerifier(config.auth))
 
 

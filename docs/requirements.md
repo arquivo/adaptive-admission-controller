@@ -148,7 +148,7 @@ The critical business logic lives entirely in the AAC. Apache httpd and Caddy ac
 | FR-011c | The system shall return HTTP `404 Not Found` for any request whose path does not match any configured backend's route, without enqueueing or scoring it. | Must |
 | FR-012 | The system shall determine the user class for each request from a fixed identity set: anonymous, authenticated researcher, service account, internal, or unknown (verification failed or ambiguous). | Must |
 | FR-013 | The system shall extract or resolve the source ASN/ISP for each request. Local TTL cache acceptable; global accuracy required for abuse signals. | Should |
-| FR-013a | The system shall resolve ASN/country from a local GeoIP/ASN database file (path configurable). It shall never fetch this database from a remote service at AAC startup or during normal operation. Refreshing the database is an explicit, separate operational action (a standalone command that downloads a new database to the configured path) run independently of the AAC process; the AAC picks up a refreshed database only on its next restart. | Must |
+| FR-013a | The system shall resolve ASN/country from two local GeoIP/ASN database files (paths configurable) — MaxMind's free GeoLite2 tier ships country and ASN data as separate files, with no combined option. It shall never fetch either database from a remote service at AAC startup or during normal operation. Refreshing a database is an explicit, separate operational action (a standalone command that downloads one edition per invocation to the configured path) run independently of the AAC process; the AAC picks up a refreshed database only on its next restart. | Must |
 | FR-014 | The system shall extract the source country for each request as an auxiliary classification signal. | Should |
 
 ### 6.3 Request Scoring
@@ -410,7 +410,7 @@ The AAC has two distinct categories of configuration, sourced differently:
 - **Graceful shutdown**: stop accepting new requests, drain queues where feasible, release all in-flight accounting.
 - **Front-end compatibility**: the AAC must be deployable behind Apache httpd today and Caddy in the future without changes to its internal logic.
 - **Containerized deployment**: the AAC ships as a container image; the policy YAML is delivered via mounted volume/ConfigMap, secrets via orchestrator-managed environment variables (see §6.10).
-- **GeoIP/ASN database refresh**: the AAC only ever reads the local GeoIP/ASN database file at startup (FR-013a); it never downloads it. Refreshing the file is a separate, explicit operational action, typically run before a rolling restart; integrating that action into the broader deployment/release process is outside the scope of this document.
+- **GeoIP/ASN database refresh**: the AAC only ever reads the two local GeoIP/ASN database files (city, ASN) at startup (FR-013a); it never downloads them. Refreshing a file is a separate, explicit operational action (`scripts/update_geoip_db.py`, one edition per invocation), typically run before a rolling restart; integrating that action into the broader deployment/release process is outside the scope of this document.
 
 ---
 

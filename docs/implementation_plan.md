@@ -113,13 +113,15 @@ ingress:
   xff_trusted_hops: 1
 
 geoip:
-  # Local MaxMind GeoLite2 file the AAC reads at startup for ASN/country
-  # lookups (FR-013, FR-013a). The AAC never downloads this file itself —
-  # see scripts/update_geoip_db.py (§4.5) for the separate, explicit refresh
-  # command, run independently of the AAC process (typically before a
-  # rolling restart); integrating that command into deployment automation
-  # is out of scope here (§8.1).
-  db_path: /var/lib/aac/GeoLite2-City.mmdb   # placeholder — set to the real deployment path
+  # Two local MaxMind GeoLite2 files the AAC reads at startup for ASN/country
+  # lookups (FR-013, FR-013a) — the free tier has no combined country+ASN
+  # file. The AAC never downloads either file itself — see
+  # scripts/update_geoip_db.py (§4.5) for the separate, explicit refresh
+  # command (one edition per invocation), run independently of the AAC
+  # process (typically before a rolling restart); integrating that command
+  # into deployment automation is out of scope here (§8.1).
+  city_db_path: /var/lib/aac/GeoLite2-City.mmdb   # placeholder — set to the real deployment path
+  asn_db_path: /var/lib/aac/GeoLite2-ASN.mmdb     # placeholder — set to the real deployment path
 
 observability:
   debug_headers:
@@ -531,8 +533,8 @@ These are the `scoring.default_penalties` values from `config/backends.yaml` (§
 ### 4.5 Tasks
 
 - [x] Implement `classifier.py` (path → backend, path → request_type, auth → user_class).
-- [x] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the local database file at `geoip.db_path` (§2.3, FR-013a) with a local TTL cache; the running AAC process never fetches this file itself.
-- [ ] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads the latest MaxMind GeoLite2 database and writes it to `geoip.db_path`; the AAC only picks up a refreshed database on its next restart (FR-013a). Deferred: the stub's `NotImplementedError` is untouched pending the MaxMind account/license-key decision (`docs/open_tbd.md`).
+- [x] Integrate GeoIP/ASN lookup library (`maxminddb`) reading the two local database files at `geoip.city_db_path`/`geoip.asn_db_path` (§2.3, FR-013a) with a local TTL cache, each failing open independently; the running AAC process never fetches either file itself.
+- [x] Implement `scripts/update_geoip_db.py` — a standalone CLI command (run manually or by deployment automation, never invoked by the AAC process) that downloads one MaxMind GeoLite2 edition per invocation (`--edition {GeoLite2-City,GeoLite2-ASN} --dest-path PATH`) from MaxMind's direct HTTP download API (HTTP Basic Auth via `MAXMIND_ACCOUNT_ID`/`MAXMIND_LICENSE_KEY`), validates it by checking `metadata().database_type` matches the requested edition, and writes it atomically; the AAC only picks up a refreshed database on its next restart (FR-013a).
 - [x] Implement `ScoreEngine` against the `PenaltyStore` interface (§2.2) — never a direct Redis client — backed by `RedisPenaltyStore` (async `INCR`+`EXPIRE`), the sole production implementation (`docs/decision_log.md` D3).
 - [x] (tests only) Implement an in-memory `FakePenaltyStore` for unit tests — not a supported deployment configuration; never referenced from `config/backends.yaml` or environment-variable wiring.
 - [x] Implement penalty functions per dimension, each taking its resolved list of `PenaltyConfig` windows (one or more per dimension — `user` has two, §2.3/§4.2) and summing the per-window soft/hard results, rather than hardcoded constants.
@@ -850,7 +852,7 @@ Scenarios:
 | Metrics | `prometheus_client` | Standard; required for Grafana/alerting integration. |
 | Logging | `structlog` or stdlib JSON formatter | Structured JSON logs per request. |
 | Config Validation | Pydantic v2 | Type-safe backend policy schema. |
-| GeoIP/ASN | `maxminddb` + MaxMind GeoLite2 | Free ASN and country data; local-file-only lookup at `geoip.db_path` (§2.3) — the AAC never fetches it itself. `scripts/update_geoip_db.py` is the separate, standalone command that refreshes the file (FR-013a). |
+| GeoIP/ASN | `maxminddb` + MaxMind GeoLite2 | Free ASN and country data; local-file-only lookup at `geoip.city_db_path`/`geoip.asn_db_path` (§2.3, two files — the free tier has no combined edition) — the AAC never fetches either itself. `scripts/update_geoip_db.py` is the separate, standalone command that refreshes one edition per invocation (FR-013a). |
 | Testing | `pytest` + `pytest-asyncio` + `httpx` test client | Async-native test suite. |
 | Load Testing | `locust` or `k6` | Scenario-based load generation. |
 

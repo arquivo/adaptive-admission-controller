@@ -48,6 +48,19 @@ this list drift from what the docs actually say.
   real front-end IP(s)/CIDRs when Apache/Caddy runs on a separate host
   (FR-010a) — that override is ordinary per-environment deployment config,
   not an open stakeholder question.
+- [x] **GeoIP/ASN refresh mechanism** — resolved 2026-08-01: MaxMind's free
+  GeoLite2 tier ships country data (`GeoLite2-City`) and ASN data
+  (`GeoLite2-ASN`) as two separate files, not one — `geoip.db_path` is now
+  `geoip.city_db_path` + `geoip.asn_db_path` (`config/backends.yaml`,
+  `implementation_plan.md` §2.3). `scripts/update_geoip_db.py` is now a real
+  implementation: one edition per invocation (`--edition
+  {GeoLite2-City,GeoLite2-ASN} --dest-path PATH`), downloading via MaxMind's
+  direct HTTP API with HTTP Basic Auth from `MAXMIND_ACCOUNT_ID`/
+  `MAXMIND_LICENSE_KEY` environment variables (no `AAC_` prefix — these are
+  MaxMind's own credentials, not AAC settings). The real deployment *paths*
+  for `city_db_path`/`asn_db_path` remain installation-dependent and are
+  still open below — only the refresh *mechanism* was the question here, and
+  it's now closed.
 
 ## Open items
 
@@ -71,12 +84,9 @@ this list drift from what the docs actually say.
   ArchivePageNow; see `docs/decision_log.md` C1, `requirements.md` §6.6).
   Ivo confirmed (2026-07-29): also installation-dependent, tuned per
   deployment rather than validated once centrally.
-- [ ] **GeoIP/ASN `db_path` and refresh mechanism** — placeholder path
-  `/var/lib/aac/GeoLite2-City.mmdb` (see `docs/decision_log.md` C6,
-  `implementation_plan.md` §2.3); genuinely open per Ivo (2026-07-29) — the
-  real deployment path isn't decided yet, and the operational mechanism for
-  actually refreshing the MaxMind GeoLite2 database (account/license key,
-  `scripts/update_geoip_db.py`'s concrete implementation) isn't established
-  either. Explicitly parked for now (2026-07-29) — Ivo declined a research
-  pass on the MaxMind refresh mechanism at this time; revisit before FR-013a
-  is implemented.
+- [ ] **GeoIP/ASN `city_db_path`/`asn_db_path`** — placeholder paths
+  `/var/lib/aac/GeoLite2-City.mmdb` / `/var/lib/aac/GeoLite2-ASN.mmdb` (see
+  `docs/decision_log.md` C6, `implementation_plan.md` §2.3); the real
+  deployment paths aren't decided yet — installation-dependent, same as the
+  other placeholder paths above. The refresh *mechanism* itself is resolved
+  (see "Resolved items" above).
