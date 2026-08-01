@@ -804,14 +804,23 @@ Scenarios:
 
 ---
 
-## 8. Phase 7 — Production Deployment
+## 8. Phase 7 — Production Deployment ⏸ (runbook reviewed for accuracy; execution needs real infrastructure)
 
 **Goal:** Roll out single-instance AAC to production with monitoring and rollback plan.
 
+**Scope note (2026-08-01):** every step below is a real-world operational action (Apache config
+changes, a live production Keycloak/Redis/GeoIP/backend topology, and 2 weeks of production
+traffic observation) — there is nothing left to *code* for this phase, and none of it is
+executable from this sandbox. What was done instead: the runbook was re-read line by line against
+the current implementation to check every concrete claim it makes (config fields, CLI flags,
+admin API behavior) is still accurate, and one real gap was found and flagged rather than silently
+carried forward — see the note on step 2 below. No application code changed as a result of this
+review; §8 itself is corrected where it no longer matched the codebase.
+
 ### 8.1 Deployment Steps
 
-1. Deploy AAC in shadow mode behind Apache httpd (receive traffic, forward directly, observe metrics without enforcing limits).
-2. Enable dry-run mode (classify and score but do not enforce admission).
+1. Deploy AAC in shadow mode behind Apache httpd (receive traffic, forward directly, observe metrics without enforcing limits). Purely an Apache/infra routing decision (e.g. `mod_proxy` mirroring or a canary subset of traffic) — no AAC feature is required for this step.
+2. **Gap found 2026-08-01:** this step assumes a dry-run/observe-only admission mode (`docs/requirements.md` FR-061: "Could" priority) that was never implemented — it does not appear in any Phase 1-6 task list (§3-7 above), so this isn't a regression, it was simply never scheduled. There is no config flag or code path in `app/` that classifies/scores a request while skipping capacity/queue enforcement. Before relying on this step as written, either (a) implement FR-061 as explicit pre-rollout work, or (b) skip directly from shadow mode (step 1, infra-only) to step 4 (enable fixed controllers for the two lowest-risk, most-predictable backends first) and lean on shadow-mode metrics plus conservative initial limits instead of a true dry-run pass.
 3. Validate that classification, scoring, and metrics are correct against real traffic.
 4. Enable fixed controllers for `pywb-patching` and `pywb-archivepagenow` (low-risk, predictable).
 5. Enable fixed controllers for `pywb-framed` and `pywb-noframe` with conservative limits.
@@ -870,7 +879,7 @@ Scenarios:
 | M4: Adaptive controller working | Phase 4 done | Simulation tests validate limit adjustment behaviour. |
 | M5: Full observability | Phase 5 done | All metrics emitted; admin API functional. |
 | M6: Staging validated | Phase 6 done | Load and failure-mode tests pass in staging. |
-| M7: Production — phase 1 | Phase 7 steps 1–3 | Shadow mode metrics match expectations. |
+| M7: Production — phase 1 | Phase 7 steps 1, 3 (step 2 blocked — see §8.1 note) | Shadow mode metrics match expectations. |
 | M8: Production — phase 2 | Phase 7 steps 4–8 | All backends under AAC; limits tuned to production data. |
 
 ---

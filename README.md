@@ -4,7 +4,7 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 6 ("Integration and Hardening") complete for the codable subset
+## Status: Phase 6 ("Integration and Hardening") complete for the codable subset; Phase 7 runbook reviewed
 
 The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
@@ -34,7 +34,12 @@ real-socket mock-backend harness (`tests/integration/test_hardening.py`), and
 real queries through the actual `page-search-api`/`image-search-api`/pywb backends, a genuine
 500-concurrent-client load test, and a real Prometheus alert firing on Redis loss — need real
 staging infrastructure this environment doesn't have, and are tracked as open in
-`docs/implementation_plan.md` §7 rather than claimed done.
+`docs/implementation_plan.md` §7 rather than claimed done. Phase 7 (Production Deployment) is a
+pure operational runbook — no further code to write — so it was reviewed line by line for accuracy
+instead: one real gap was found, `docs/implementation_plan.md` §8.1 step 2 ("dry-run mode")
+assumes `docs/requirements.md` FR-061, which is "Could" priority and was never implemented in any
+phase; the rollout runbook now explains this and recommends skipping straight from shadow mode to
+enabling the lowest-risk fixed-controller backends first instead.
 
 
 
