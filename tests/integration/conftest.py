@@ -14,7 +14,9 @@ import copy
 import hashlib
 import socket
 from contextlib import asynccontextmanager
+from unittest.mock import patch
 
+import fakeredis
 import httpx
 import pytest
 import pytest_asyncio
@@ -219,13 +221,27 @@ def make_config(
 
 
 @asynccontextmanager
-async def running_app(config: AACConfig, *, client_peer: tuple[str, int] = ("127.0.0.1", 12345)):
+async def running_app(
+    config: AACConfig,
+    *,
+    client_peer: tuple[str, int] = ("127.0.0.1", 12345),
+    redis_factory=fakeredis.FakeAsyncRedis,
+):
     """Runs `create_app(config)` through its real lifespan (dispatchers,
     redis client) and yields an `httpx.AsyncClient` talking to it over
     `httpx.ASGITransport` — no real socket needed for the AAC side itself,
-    only for the upstream mock backend (see module docstring)."""
+    only for the upstream mock backend (see module docstring).
+
+    Defaults `app.state.redis` to an in-memory `fakeredis` client — every
+    request now scores via `RedisPenaltyStore` (Phase 3), so a real Redis
+    would otherwise be required for every test in this module. Pass
+    `redis_factory` to substitute a different double (e.g. one that
+    simulates an unreachable Redis for `/readyz` tests).
+    """
     app = create_app(config=config)
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, client=client_peer)
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            yield app, client
+    with patch("app.main.redis_asyncio.from_url", lambda *_a, **_k: redis_factory()):
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, client=client_peer)
+            base_url = "http://testserver"
+            async with httpx.AsyncClient(transport=transport, base_url=base_url) as client:
+                yield app, client

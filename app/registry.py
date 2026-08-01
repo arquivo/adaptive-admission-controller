@@ -4,18 +4,28 @@ backend using longest-prefix-wins matching (FR-011a).
 
 from __future__ import annotations
 
+from app.auth import JWTVerifier
 from app.classifier import classify
 from app.config import AACConfig, BackendConfig, ResolvedScoringConfig, resolve_scoring_config
+from app.geoip import GeoIPLookup
 from app.interfaces import BackendPolicy, RequestContext
 
 
 class DefaultBackendPolicy(BackendPolicy):
-    def __init__(self, config: BackendConfig, resolved_scoring: ResolvedScoringConfig):
+    def __init__(
+        self,
+        config: BackendConfig,
+        resolved_scoring: ResolvedScoringConfig,
+        geoip: GeoIPLookup,
+        auth: JWTVerifier,
+    ):
         self.config = config
         self.resolved_scoring = resolved_scoring
+        self.geoip = geoip
+        self.auth = auth
 
     def classify(self, request) -> RequestContext:
-        return classify(request, self)
+        return classify(request, self, self.geoip, self.auth)
 
     def estimate_cost(self, ctx: RequestContext) -> int:
         return 1  # uniform cost for all request types (docs/decision_log.md A3)
@@ -38,10 +48,10 @@ class BackendPolicyRegistry:
     config resolution") — never recomputed per request.
     """
 
-    def __init__(self, config: AACConfig):
+    def __init__(self, config: AACConfig, geoip: GeoIPLookup, auth: JWTVerifier):
         self._policies: dict[str, DefaultBackendPolicy] = {
             backend.name: DefaultBackendPolicy(
-                backend, resolve_scoring_config(config.scoring, backend.name)
+                backend, resolve_scoring_config(config.scoring, backend.name), geoip, auth
             )
             for backend in config.backends
         }

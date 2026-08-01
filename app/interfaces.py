@@ -11,10 +11,28 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from starlette.requests import Request
+
+
+class UserClass(StrEnum):
+    """Identity-only classification (`docs/implementation_plan.md` §4.1a,
+    `docs/decision_log.md` A4) — reflects *who is asking*, never *how they
+    are behaving*. There is deliberately no `suspicious`/`bot` member: an
+    abusive client is still one of these five, and is driven toward the back
+    of the queue by the per-IP/subnet/ASN/country/user penalties in
+    `app.scoring`, not by a separate behavior guess that would double-count
+    the same signal.
+    """
+
+    ANONYMOUS = "anonymous"
+    RESEARCHER = "researcher"
+    SERVICE_ACCOUNT = "service_account"
+    INTERNAL = "internal"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -31,6 +49,7 @@ class RequestContext:
     source_ip: str | None = None
     user_class: str | None = None
     subnet_24: str | None = None
+    subnet_6: str | None = None
     asn: str | None = None
     country: str | None = None
     user_id: str | None = None

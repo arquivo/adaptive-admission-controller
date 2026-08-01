@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 
-import fakeredis
 import pytest
 
 from tests.integration.conftest import _free_port, make_config, running_app
@@ -126,12 +125,7 @@ async def test_untrusted_peer_rejected_403(mock_backend):
     assert response.status_code == 403
 
 
-async def test_health_and_ready_endpoints_exempt_from_trusted_proxy_check(
-    mock_backend, monkeypatch
-):
-    monkeypatch.setattr(
-        "app.main.redis_asyncio.from_url", lambda *_a, **_k: fakeredis.FakeAsyncRedis()
-    )
+async def test_health_and_ready_endpoints_exempt_from_trusted_proxy_check(mock_backend):
     config = make_config(mock_backend, trusted_proxies=["127.0.0.1"])
     async with running_app(config, client_peer=("10.0.0.9", 1)) as (_app, client):
         healthz_response = await client.get("/healthz")
@@ -141,10 +135,7 @@ async def test_health_and_ready_endpoints_exempt_from_trusted_proxy_check(
     assert readyz_response.status_code == 200
 
 
-async def test_readyz_ready_when_redis_reachable(mock_backend, monkeypatch):
-    monkeypatch.setattr(
-        "app.main.redis_asyncio.from_url", lambda *_a, **_k: fakeredis.FakeAsyncRedis()
-    )
+async def test_readyz_ready_when_redis_reachable(mock_backend):
     config = make_config(mock_backend)
     async with running_app(config) as (_app, client):
         response = await client.get("/readyz")
@@ -153,7 +144,7 @@ async def test_readyz_ready_when_redis_reachable(mock_backend, monkeypatch):
     assert response.json()["status"] == "ready"
 
 
-async def test_readyz_not_ready_when_redis_unreachable(mock_backend, monkeypatch):
+async def test_readyz_not_ready_when_redis_unreachable(mock_backend):
     class _UnreachableRedis:
         async def ping(self):
             raise ConnectionError("simulated redis outage")
@@ -161,11 +152,8 @@ async def test_readyz_not_ready_when_redis_unreachable(mock_backend, monkeypatch
         async def aclose(self):
             pass
 
-    monkeypatch.setattr(
-        "app.main.redis_asyncio.from_url", lambda *_a, **_k: _UnreachableRedis()
-    )
     config = make_config(mock_backend)
-    async with running_app(config) as (_app, client):
+    async with running_app(config, redis_factory=_UnreachableRedis) as (_app, client):
         response = await client.get("/readyz")
 
     assert response.status_code == 503

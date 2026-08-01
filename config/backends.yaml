@@ -21,6 +21,19 @@ geoip:
   # lookups (FR-013, FR-013a). Placeholder path — see docs/open_tbd.md.
   db_path: /var/lib/aac/GeoLite2-City.mmdb
 
+auth:
+  # Keycloak JWT verification (FR-012) — purely a scoring/priority input, a
+  # verified token buys a request a higher `researcher` base score below; the
+  # AAC has no login flow of its own and never gates access on this. Off by
+  # default: every request classifies as `anonymous` until a real realm is
+  # configured. `issuer`/`jwks_url` are installation-dependent placeholders —
+  # see docs/open_tbd.md.
+  enabled: false
+  issuer: https://keycloak.example.org/realms/arquivo
+  jwks_url: https://keycloak.example.org/realms/arquivo/protocol/openid-connect/certs
+  audience: aac
+  jwks_refresh_seconds: 300
+
 observability:
   debug_headers:
     # Attaches X-AAC-Backend/Score/Exempt/Reject-Reason to every response

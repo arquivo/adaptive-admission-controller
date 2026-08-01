@@ -62,6 +62,29 @@ class GeoIPConfig(BaseModel):
     db_path: Path
 
 
+class AuthConfig(BaseModel):
+    """Keycloak JWT verification for `user_class`/`user_id` classification
+    (`docs/implementation_plan.md` §4.1, `requirements.md` FR-012). Purely a
+    scoring/priority input — the AAC has no login flow of its own and never
+    gates access on this. Disabled by default: every request classifies as
+    `UserClass.ANONYMOUS` until an environment configures a real Keycloak
+    realm (`issuer`/`jwks_url` are installation-dependent, see
+    `docs/open_tbd.md`).
+    """
+
+    enabled: bool = False
+    issuer: str | None = None
+    jwks_url: HttpUrl | None = None
+    audience: str | None = None
+    jwks_refresh_seconds: float = Field(default=300, gt=0)
+
+    @model_validator(mode="after")
+    def _check_enabled_requires_issuer(self) -> AuthConfig:
+        if self.enabled and (self.issuer is None or self.jwks_url is None):
+            raise ValueError("auth.issuer and auth.jwks_url are required when auth.enabled is true")
+        return self
+
+
 class DebugHeadersConfig(BaseModel):
     enabled: bool = False
 
@@ -137,6 +160,7 @@ class ResolvedScoringConfig(BaseModel):
 
     base_scores: dict[str, int]
     exempt_countries: list[str]
+    ipv6_prefix_length: Literal[48, 56]
     score_clamp: ScoreClamp
     penalties: DefaultPenalties
 
@@ -178,6 +202,7 @@ BackendConfig = Annotated[
 class AACConfig(BaseModel):
     ingress: IngressConfig
     geoip: GeoIPConfig
+    auth: AuthConfig = AuthConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
     scoring: ScoringConfig
     backends: list[BackendConfig] = Field(min_length=1)
@@ -234,6 +259,7 @@ def resolve_scoring_config(scoring: ScoringConfig, backend_name: str) -> Resolve
     return ResolvedScoringConfig(
         base_scores=base_scores,
         exempt_countries=list(scoring.exempt_countries),
+        ipv6_prefix_length=scoring.ipv6_prefix_length,
         score_clamp=scoring.score_clamp,
         penalties=DefaultPenalties(**penalties),
     )
