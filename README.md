@@ -4,17 +4,21 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 2 ("Fixed Admission Controller") complete
+## Status: Phase 3 ("Request Classification and Scoring Engine") complete
 
 The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
-streaming dispatcher. Phase 2 adds admission control on top of that: every request now flows
+streaming dispatcher. Phase 2 added admission control on top of that: every request now flows
 through a per-backend priority queue and a blocking concurrency gate before being dispatched —
 a backend can no longer be overwhelmed by unbounded concurrent traffic. Requests are rejected
 with `429` if the queue is full or a projected wait already exceeds the configured timeout, and
 with `503` if a request times out waiting in the queue or the backend itself times out.
-Request scoring/prioritization (beyond a fixed default score) and adaptive concurrency land in
-later phases.
+Phase 3 wires in real request classification and Redis-backed scoring: every request is
+classified by source IP/subnet, GeoIP country/ASN, and (optionally) a verified Keycloak JWT, then
+scored against per-backend penalty thresholds so the priority queue actually reorders requests
+meaningfully instead of only ever seeing ties. A verified JWT only ever raises a request's
+priority — the AAC never gates access on authentication. Adaptive concurrency and full
+observability (metrics, admin API, diagnostic headers) land in later phases.
 
 ## Backends
 
@@ -34,7 +38,7 @@ which all live under a single host per environment:
 
 - Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/)
-- Redis (for `/readyz`; scoring/penalties aren't wired in until Phase 3)
+- Redis (for `/readyz` and Redis-backed penalty counters)
 
 ## Setup
 
