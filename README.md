@@ -4,12 +4,17 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 1 ("Foundation") complete
+## Status: Phase 2 ("Fixed Admission Controller") complete
 
-The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivers a
+The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
-streaming dispatcher — no queueing, capacity control, or scoring on the request path yet. Those
-land in later phases.
+streaming dispatcher. Phase 2 adds admission control on top of that: every request now flows
+through a per-backend priority queue and a blocking concurrency gate before being dispatched —
+a backend can no longer be overwhelmed by unbounded concurrent traffic. Requests are rejected
+with `429` if the queue is full or a projected wait already exceeds the configured timeout, and
+with `503` if a request times out waiting in the queue or the backend itself times out.
+Request scoring/prioritization (beyond a fixed default score) and adaptive concurrency land in
+later phases.
 
 ## Backends
 
@@ -79,7 +84,8 @@ Integration tests spin up a real-socket mock upstream backend and drive the full
 - `/readyz` — readiness: config loaded at startup and Redis reachable. Per-backend reachability
   is intentionally excluded, so one dead backend doesn't pull the whole AAC out of rotation.
 - `/metrics` — Prometheus metrics (stub; the full metric set lands in Phase 5).
-- Everything else is proxied to the matching backend, or `404` if no configured prefix matches.
+- Everything else is proxied to the matching backend (subject to that backend's queue/concurrency
+  limits), or `404` if no configured prefix matches.
 
 ## Documentation
 
