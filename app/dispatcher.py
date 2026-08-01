@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
+from app import metrics, observability
 from app.config import BackendConfig
 
 if TYPE_CHECKING:
@@ -108,19 +109,39 @@ class BackendDispatcher:
         ctx: RequestContext,
         future: asyncio.Future,
         controller: CapacityController,
+        queue_wait_ms: float = 0.0,
     ) -> None:
         """Run by `PriorityScheduler.run_worker()` from a detached task once
         a capacity slot has been acquired for this request. Always releases
         the slot (FR-052: immediately on response or timeout) and resolves
         `future` with the final `Response` — unless `future` was already
         cancelled (the original request gave up first), in which case any
-        already-open upstream response is closed directly instead."""
+        already-open upstream response is closed directly instead.
+
+        Every outcome here counts as "admitted" (`observability.
+        log_admission_event("admitted", ...)`) regardless of the backend's
+        own status code — a backend-originated 502/503 is a backend problem,
+        tracked separately via `backend_errors_total`/`backend_timeouts_total`,
+        not an admission-control rejection."""
+        name = self._config.name
+        class_label = ctx.user_class or "unknown"
         start = time.monotonic()
         try:
             upstream_response, response = await self._send_and_stream(request)
         except httpx.TimeoutException:
             latency_ms = (time.monotonic() - start) * 1000
             await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=True)
+            metrics.backend_timeouts_total.labels(name).inc()
+            metrics.backend_request_duration_seconds.labels(name, class_label).observe(
+                latency_ms / 1000
+            )
+            observability.log_admission_event(
+                "admitted",
+                ctx,
+                queue_wait_ms=queue_wait_ms,
+                backend_latency_ms=latency_ms,
+                status_code=503,
+            )
             if not future.cancelled():
                 future.set_result(
                     JSONResponse(
@@ -135,13 +156,35 @@ class BackendDispatcher:
             # (FR-083a: a dead backend affects only its own path).
             latency_ms = (time.monotonic() - start) * 1000
             await controller.release(1, latency_ms=latency_ms, status_code=0, timed_out=False)
+            metrics.backend_errors_total.labels(name).inc()
+            metrics.backend_request_duration_seconds.labels(name, class_label).observe(
+                latency_ms / 1000
+            )
+            observability.log_admission_event(
+                "admitted",
+                ctx,
+                queue_wait_ms=queue_wait_ms,
+                backend_latency_ms=latency_ms,
+                status_code=502,
+            )
             if not future.cancelled():
                 future.set_result(JSONResponse({"detail": "bad gateway"}, status_code=502))
             return
 
         latency_ms = (time.monotonic() - start) * 1000
-        await controller.release(
-            1, latency_ms=latency_ms, status_code=upstream_response.status_code, timed_out=False
+        status_code = upstream_response.status_code
+        await controller.release(1, latency_ms=latency_ms, status_code=status_code, timed_out=False)
+        if status_code >= 500:
+            metrics.backend_errors_total.labels(name).inc()
+        metrics.backend_request_duration_seconds.labels(name, class_label).observe(
+            latency_ms / 1000
+        )
+        observability.log_admission_event(
+            "admitted",
+            ctx,
+            queue_wait_ms=queue_wait_ms,
+            backend_latency_ms=latency_ms,
+            status_code=status_code,
         )
 
         if future.cancelled():

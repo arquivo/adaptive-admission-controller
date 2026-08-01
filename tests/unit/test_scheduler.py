@@ -44,7 +44,9 @@ def test_estimate_wait_seconds_computes_littles_law_estimate():
 
 async def test_enqueue_raises_queue_full_before_touching_wait_projection():
     controller = FixedController(limit=100)  # generous, so projected wait is 0 either way
-    scheduler = PriorityScheduler(queue_max_size=1, queue_timeout=300, controller=controller)
+    scheduler = PriorityScheduler(
+        backend_name="mock-backend", queue_max_size=1, queue_timeout=300, controller=controller
+    )
 
     await scheduler.enqueue(_FakeRequest(), _ctx())
     with pytest.raises(QueueFullError):
@@ -59,7 +61,9 @@ async def test_enqueue_raises_queue_wait_exceeded_before_queue_is_full():
     # queue (projected wait 0 regardless of timeout) and always succeeds; the
     # second sees queue_depth=1, projecting a 1s wait against a 0.5s timeout
     # -- well under queue_max_size=1000, so this is FR-033a firing, not FR-033.
-    scheduler = PriorityScheduler(queue_max_size=1000, queue_timeout=0.5, controller=controller)
+    scheduler = PriorityScheduler(
+        backend_name="mock-backend", queue_max_size=1000, queue_timeout=0.5, controller=controller
+    )
     await scheduler.enqueue(_FakeRequest(), _ctx())
 
     with pytest.raises(QueueWaitExceededError):
@@ -68,11 +72,13 @@ async def test_enqueue_raises_queue_wait_exceeded_before_queue_is_full():
 
 async def test_run_worker_releases_capacity_for_cancelled_future_without_dispatching():
     controller = FixedController(limit=1)
-    scheduler = PriorityScheduler(queue_max_size=10, queue_timeout=300, controller=controller)
+    scheduler = PriorityScheduler(
+        backend_name="mock-backend", queue_max_size=10, queue_timeout=300, controller=controller
+    )
     dispatched = []
 
     class _RecordingDispatcher:
-        async def dispatch_queued(self, request, ctx, future, controller):
+        async def dispatch_queued(self, request, ctx, future, controller, queue_wait_ms=0.0):
             dispatched.append(request)
             future.set_result("ok")
 

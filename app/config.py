@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     config_path: Path = Path("config/backends.yaml")
     redis_url: str = "redis://localhost:6379/0"
     log_level: str = "INFO"
+    # Bearer token for `/admin/*` (FR-081/FR-084) — unset/empty means those
+    # routes fail closed with 403 rather than defaulting to open access.
+    admin_api_token: str | None = None
 
 
 # ---------------------------------------------------------------------------

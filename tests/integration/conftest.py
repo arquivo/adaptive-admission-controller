@@ -192,6 +192,7 @@ def make_config(
     concurrency_limit: int = 100,
     queue_max_size: int = 100,
     queue_timeout_seconds: float = 30,
+    debug_headers_enabled: bool = False,
 ) -> AACConfig:
     """A minimal single-backend `AACConfig` pointed at a real (mock) upstream,
     for driving the proxy round trip end to end."""
@@ -205,6 +206,7 @@ def make_config(
                 "city_db_path": "/nonexistent/GeoLite2-City.mmdb",
                 "asn_db_path": "/nonexistent/GeoLite2-ASN.mmdb",
             },
+            "observability": {"debug_headers": {"enabled": debug_headers_enabled}},
             "scoring": copy.deepcopy(_MINIMAL_SCORING),
             "backends": [
                 {

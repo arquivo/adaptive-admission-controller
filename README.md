@@ -4,7 +4,7 @@ An async reverse-proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 (Apache httpd/Caddy) and the backend services, protecting them from overload via per-backend
 concurrency limits and prioritizing legitimate traffic using Redis-backed scoring.
 
-## Status: Phase 4 ("Adaptive Concurrency Controller") complete
+## Status: Phase 5 ("Full Observability") complete
 
 The project is being built in phases (see `docs/implementation_plan.md`). Phase 1 delivered a
 config-driven pass-through proxy: trusted-proxy ingress, longest-prefix backend routing, and a
@@ -22,8 +22,11 @@ stand-in for `controller: adaptive` backends with a real p95-based adaptive cont
 background loop periodically shrinks or grows each backend's concurrency limit from its rolling
 p95 latency, timeout rate, and 5xx rate, relative to a configured target and thresholds — an
 overloaded backend gets throttled automatically, and a healthy one is allowed to grow back
-towards its configured maximum. Full observability (metrics, admin API, diagnostic headers) lands
-in Phase 5.
+towards its configured maximum. Phase 5 completes observability: all 14 Prometheus metrics are
+registered and updated live, every admission decision emits a structured JSON log line, an
+opt-in set of `X-AAC-*` diagnostic response headers can be enabled for interactive debugging, and
+a GET-only, bearer-token-authenticated `/admin/*` API exposes live backend policy/limit/queue
+state.
 
 ## Backends
 
@@ -55,8 +58,10 @@ uv sync
 
 The AAC is configured via a YAML file (default `config/backends.yaml`, overridable with the
 `AAC_CONFIG_PATH` environment variable) plus a small set of `AAC_`-prefixed environment
-variables (`AAC_REDIS_URL`, `AAC_LOG_LEVEL`) — see `app/config.py`. Invalid or incomplete config
-fails process startup with a non-zero exit rather than serving traffic.
+variables (`AAC_REDIS_URL`, `AAC_LOG_LEVEL`, `AAC_ADMIN_API_TOKEN`) — see `app/config.py`.
+Invalid or incomplete config fails process startup with a non-zero exit rather than serving
+traffic. Diagnostic response headers (see Endpoints below) are opt-in via the config file's
+`observability.debug_headers.enabled` (default `false`).
 
 `config/backends.yaml` is an example config with illustrative `upstream_url` values — real
 hosts/ports, concurrency limits, and thresholds are environment-specific and tracked as open
@@ -110,7 +115,15 @@ Integration tests spin up a real-socket mock upstream backend and drive the full
 - `/healthz` — liveness.
 - `/readyz` — readiness: config loaded at startup and Redis reachable. Per-backend reachability
   is intentionally excluded, so one dead backend doesn't pull the whole AAC out of rotation.
-- `/metrics` — Prometheus metrics (stub; the full metric set lands in Phase 5).
+- `/metrics` — Prometheus metrics: all 14 admission/backend/queue/score metrics from
+  `docs/requirements.md §6.8`.
+- `/admin/backends`, `/admin/backends/{name}/policy`, `/admin/backends/{name}/limit` — GET-only
+  administrative API (live policy/limit/queue snapshot). Requires `Authorization: Bearer <token>`
+  matching `AAC_ADMIN_API_TOKEN`; if that env var is unset/empty, all `/admin/*` routes fail
+  closed with `403` rather than defaulting to open access.
+- Every response optionally carries `X-AAC-Backend`/`X-AAC-Score`/`X-AAC-Exempt`/
+  `X-AAC-Reject-Reason` diagnostic headers when `observability.debug_headers.enabled` is `true`
+  (default `false`) — see `docs/implementation_plan.md` §6.2a.
 - Everything else is proxied to the matching backend (subject to that backend's queue/concurrency
   limits), or `404` if no configured prefix matches.
 

@@ -14,13 +14,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis_asyncio
 from fastapi import FastAPI
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
+from app import metrics, observability
+from app.admin import routes as admin_routes
 from app.auth import JWTVerifier
 from app.capacity import AdaptiveController, FixedController
 from app.config import AACConfig, Settings, load_config, resolve_scoring_config
@@ -42,6 +45,7 @@ def _build_lifespan(preloaded_config: AACConfig | None):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         settings = Settings()
+        observability.configure_logging(settings.log_level)
 
         if preloaded_config is not None:
             config = preloaded_config
@@ -56,6 +60,7 @@ def _build_lifespan(preloaded_config: AACConfig | None):
                 os._exit(1)
 
         app.state.config = config
+        app.state.admin_api_token = settings.admin_api_token
         app.state.redis = redis_asyncio.from_url(settings.redis_url)
         app.state.geoip = GeoIPLookup(config.geoip.city_db_path, config.geoip.asn_db_path)
         app.state.auth = JWTVerifier(config.auth)
@@ -78,11 +83,13 @@ def _build_lifespan(preloaded_config: AACConfig | None):
         for backend in config.backends:
             if backend.controller == "fixed":
                 controller = FixedController(backend.concurrency_limit)
+                metrics.concurrency_limit.labels(backend.name).set(backend.concurrency_limit)
             else:
                 controller = AdaptiveController(backend)
+                metrics.concurrency_limit.labels(backend.name).set(backend.initial_concurrency)
                 worker_tasks.append(asyncio.create_task(controller.adjust_loop()))
             scheduler = PriorityScheduler(
-                backend.queue_max_size, backend.queue_timeout_seconds, controller
+                backend.name, backend.queue_max_size, backend.queue_timeout_seconds, controller
             )
             app.state.controllers[backend.name] = controller
             app.state.schedulers[backend.name] = scheduler
@@ -115,25 +122,74 @@ async def proxy_handler(request: Request):
     backend_name = policy.config.name
     ctx = policy.classify(request)
     ctx.score = await request.app.state.score_engine.score(ctx)
-    scheduler = request.app.state.schedulers[backend_name]
+    exempt_label = "true" if ctx.score_breakdown and ctx.score_breakdown.is_exempt else "false"
+    class_label = ctx.user_class or "unknown"
+    debug_enabled = request.app.state.config.observability.debug_headers.enabled
 
+    def _finalize(response: Response, *, reject_reason: str | None = None) -> Response:
+        if debug_enabled:
+            response.headers["X-AAC-Backend"] = backend_name
+            response.headers["X-AAC-Score"] = str(ctx.score)
+            response.headers["X-AAC-Exempt"] = exempt_label
+            if reject_reason is not None:
+                response.headers["X-AAC-Reject-Reason"] = reject_reason
+        return response
+
+    metrics.requests_total.labels(backend_name, class_label, exempt_label).inc()
+    metrics.score_distribution.labels(backend_name, exempt_label).observe(ctx.score)
+
+    scheduler = request.app.state.schedulers[backend_name]
     try:
         future = await scheduler.enqueue(request, ctx)
     except QueueWaitExceededError:
-        return JSONResponse(
-            {"detail": "too many requests", "reason": "queue_wait_exceeded"}, status_code=429
+        metrics.rejected_total.labels(
+            backend_name, class_label, "queue_wait_exceeded", exempt_label
+        ).inc()
+        observability.log_admission_event(
+            "rejected", ctx, reason="queue_wait_exceeded", status_code=429
+        )
+        return _finalize(
+            JSONResponse(
+                {"detail": "too many requests", "reason": "queue_wait_exceeded"}, status_code=429
+            ),
+            reject_reason="queue_wait_exceeded",
         )
     except QueueFullError:
-        return JSONResponse(
-            {"detail": "too many requests", "reason": "queue_full"}, status_code=429
+        metrics.rejected_total.labels(backend_name, class_label, "queue_full", exempt_label).inc()
+        observability.log_admission_event("rejected", ctx, reason="queue_full", status_code=429)
+        return _finalize(
+            JSONResponse({"detail": "too many requests", "reason": "queue_full"}, status_code=429),
+            reject_reason="queue_full",
         )
 
+    metrics.inflight_requests.labels(backend_name).inc()
+    metrics.inflight_tokens.labels(backend_name).inc(ctx.cost)
     try:
-        return await asyncio.wait_for(future, timeout=policy.config.queue_timeout_seconds)
+        response = await asyncio.wait_for(future, timeout=policy.config.queue_timeout_seconds)
     except TimeoutError:
-        return JSONResponse(
-            {"detail": "service unavailable", "reason": "queue_timeout"}, status_code=503
+        metrics.queue_timeout_total.labels(backend_name).inc()
+        metrics.rejected_total.labels(
+            backend_name, class_label, "queue_timeout", exempt_label
+        ).inc()
+        observability.log_admission_event(
+            "rejected",
+            ctx,
+            reason="queue_timeout",
+            queue_wait_ms=(time.monotonic() - ctx.arrival_time) * 1000,
+            status_code=503,
         )
+        return _finalize(
+            JSONResponse(
+                {"detail": "service unavailable", "reason": "queue_timeout"}, status_code=503
+            ),
+            reject_reason="queue_timeout",
+        )
+    else:
+        metrics.admitted_total.labels(backend_name, class_label, exempt_label).inc()
+        return _finalize(response)
+    finally:
+        metrics.inflight_requests.labels(backend_name).dec()
+        metrics.inflight_tokens.labels(backend_name).dec(ctx.cost)
 
 
 def create_app(config: AACConfig | None = None) -> FastAPI:
@@ -144,11 +200,13 @@ def create_app(config: AACConfig | None = None) -> FastAPI:
     app = FastAPI(lifespan=_build_lifespan(config))
     app.add_middleware(TrustedProxyMiddleware)
 
-    # Health/metrics routes registered before the catch-all proxy route so
-    # they're matched first.
+    # Health/metrics/admin routes registered before the catch-all proxy
+    # route so they're matched first.
     for route in health_routes:
         app.router.routes.append(route)
     for route in metrics_routes:
+        app.router.routes.append(route)
+    for route in admin_routes:
         app.router.routes.append(route)
 
     app.add_api_route(
@@ -157,3 +215,4 @@ def create_app(config: AACConfig | None = None) -> FastAPI:
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
     )
     return app
+

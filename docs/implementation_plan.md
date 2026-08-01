@@ -27,7 +27,7 @@
 | 2 — Fixed Admission | Fixed capacity controller + priority queue per backend | Load test shows fixed concurrency enforced correctly |
 | 3 — Scoring Engine | Request classifier + Redis-based scoring | Score decomposition visible in logs; penalties applied |
 | 4 — Adaptive Controller | p95-based adaptive concurrency for Search APIs/pywb | Simulated latency curves drive correct limit changes |
-| 5 — Observability | Full Prometheus metrics + structured logs + admin API | Metrics visible in test Grafana; alerts fire correctly |
+| 5 — Observability ✅ | Full Prometheus metrics + structured logs + admin API | Metrics visible in test Grafana; alerts fire correctly |
 | 6 — Integration & Hardening | Real backends in staging; failure-mode tests | Passes load test and failure injection suite |
 | 7 — Production Deploy | Single-instance production rollout | Monitored rollout; baseline metrics captured |
 
@@ -670,7 +670,7 @@ class AdaptiveController(CapacityController):
 
 ---
 
-## 6. Phase 5 — Full Observability
+## 6. Phase 5 — Full Observability ✅
 
 **Goal:** Complete Prometheus metrics, structured JSON logs, and the administrative API.
 
@@ -743,20 +743,20 @@ These mirror a subset of the fields already logged per request (§6.2) — a lig
 
 ### 6.3 Administrative API Tasks
 
-- [ ] Implement `GET /admin/backends` — list backends with current policy and live metrics snapshot.
-- [ ] Implement `GET /admin/backends/{name}/policy` — view active backend policy (GET-only for MVP; no runtime hot-reload — see FR-084, and `docs/decision_log.md` B3).
-- [ ] Implement `GET /admin/backends/{name}/limit` — current limit (fixed or adaptive).
-- [ ] Enforce authentication on all `/admin/*` endpoints.
+- [x] Implement `GET /admin/backends` — list backends with current policy and live metrics snapshot.
+- [x] Implement `GET /admin/backends/{name}/policy` — view active backend policy (GET-only for MVP; no runtime hot-reload — see FR-084, and `docs/decision_log.md` B3).
+- [x] Implement `GET /admin/backends/{name}/limit` — current limit (fixed or adaptive).
+- [x] Enforce authentication on all `/admin/*` endpoints.
 
 ### 6.4 Tasks
 
-- [ ] Register all required Prometheus metrics.
-- [ ] Emit structured JSON log per request (admission, rejection, timeout, limit change).
-- [ ] Expose `/metrics` endpoint.
-- [ ] Implement admin API endpoints.
-- [ ] Implement opt-in diagnostic response headers (`X-AAC-Backend`, `X-AAC-Score`, `X-AAC-Exempt`, `X-AAC-Reject-Reason`) gated by `observability.debug_headers.enabled` (default `false`, §6.2a, FR-074).
-- [ ] Unit tests: headers absent by default; present with correct values when enabled, including `X-AAC-Reject-Reason` on a rejected request and its absence on an admitted one.
-- [ ] Write integration test: verify expected metrics are emitted under load.
+- [x] Register all required Prometheus metrics.
+- [x] Emit structured JSON log per request (admission, rejection, timeout, limit change).
+- [x] Expose `/metrics` endpoint.
+- [x] Implement admin API endpoints.
+- [x] Implement opt-in diagnostic response headers (`X-AAC-Backend`, `X-AAC-Score`, `X-AAC-Exempt`, `X-AAC-Reject-Reason`) gated by `observability.debug_headers.enabled` (default `false`, §6.2a, FR-074).
+- [x] Unit tests: headers absent by default; present with correct values when enabled, including `X-AAC-Reject-Reason` on a rejected request and its absence on an admitted one.
+- [x] Write integration test: verify expected metrics are emitted under load.
 
 ---
 

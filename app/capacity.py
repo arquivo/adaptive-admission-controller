@@ -15,6 +15,7 @@ import logging
 import time
 from collections import deque
 
+from app import metrics
 from app.config import AdaptiveBackendConfig
 from app.interfaces import CapacityController
 
@@ -190,6 +191,8 @@ class AdaptiveController(CapacityController):
                 "error_rate": error_rate,
             },
         )
+        metrics.adaptive_limit_changes_total.labels(self._name).inc()
+        metrics.concurrency_limit.labels(self._name).set(self._limit)
         if self._limit > old_limit:
             # Raising the limit must immediately unblock any `acquire()`
             # already waiting — otherwise a queued request only benefits
