@@ -149,6 +149,16 @@ consistent with the rest of the codebase:
 - **Integration tests use a real-socket mock upstream backend** (`tests/integration/conftest.py`),
   driven through the real app via `httpx.ASGITransport` — this exercises the actual streaming
   dispatch path (`app/dispatcher.py`) rather than mocking `httpx` itself.
+- **A few integration tests talk to genuinely real external systems**, not fakes, for the paths
+  where a fake's behavior could quietly diverge from the real thing:
+  `tests/integration/test_redis_real.py` connects to a real Redis (db 15, `AAC_TEST_REDIS_URL` env
+  var, default `redis://localhost:6379/15`) and skips cleanly if none is reachable — the
+  `docker-compose.yml` `redis` service doesn't publish its port to the host (only `aac` reaches it,
+  by its internal Docker network hostname), so run `docker run --rm -d -p 6379:6379 redis:7-alpine`
+  locally instead, or rely on CI's Redis service container (below), which does publish `6379`.
+  Everything else in the suite still defaults to `fakeredis`. `tests/integration/test_auth_jwks_e2e.py` spins up a real
+  local HTTP server serving a JWK Set, so `JWTVerifier`'s actual fetch-and-parse path runs, not just
+  its `verify()` logic against an injected key.
 
 Run the full suite with:
 
@@ -156,6 +166,15 @@ Run the full suite with:
 uv run pytest        # unit + integration tests
 uv run ruff check .  # lint (line-length 100, target py312)
 ```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request to `main`: a `lint` job (`uv run
+ruff check .`) and a `test` job (`uv run pytest -q`) with a `redis:7-alpine` service container so
+`test_redis_real.py` runs for real in CI rather than skipping. `.github/workflows/smoke.yml`
+separately runs the Docker Compose failover/failback smoke test (see
+[Deployment — Failover smoke test](deployment.md#failover-smoke-test)) on a weekly schedule and via
+manual `workflow_dispatch`, since it's slower and needs Docker-in-Docker.
 
 ## Design constraints worth knowing before you change something
 

@@ -1,0 +1,13 @@
+name: Failover smoke test
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/smoke_test_failover.sh

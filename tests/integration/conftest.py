@@ -89,6 +89,21 @@ async def _fail(request: Request) -> JSONResponse:
     return JSONResponse({"error": "simulated backend failure"}, status_code=500)
 
 
+async def _multi_cookie(request: Request) -> JSONResponse:
+    """Returns two distinct `Set-Cookie` headers — a headers `dict` would
+    silently collapse them, so this proves `BackendDispatcher`'s
+    `raw_headers`-based response construction (`app/dispatcher.py:105-108`)
+    genuinely preserves repeated headers end to end, not just in a unit
+    test of the dispatcher itself."""
+    response = JSONResponse({"ok": True})
+    response.raw_headers = [
+        *response.raw_headers,
+        (b"set-cookie", b"a=1"),
+        (b"set-cookie", b"b=2"),
+    ]
+    return response
+
+
 async def _dispatch_by_suffix(
     request: Request, slow_handler, counter: dict[str, int] | None = None
 ):
@@ -104,6 +119,8 @@ async def _dispatch_by_suffix(
         return await slow_handler(request)
     if path.rstrip("/").endswith("/fail"):
         return await _fail(request)
+    if path.rstrip("/").endswith("/multi-cookie"):
+        return await _multi_cookie(request)
     return await _echo(request, counter)
 
 
@@ -131,8 +148,11 @@ def _free_port() -> int:
 
 
 @asynccontextmanager
-async def _running_mock_backend(concurrency: dict[str, int]):
-    port = _free_port()
+async def _running_mock_backend(concurrency: dict[str, int], *, port: int | None = None):
+    """`port` lets a test rebind a mock backend onto a port that previously
+    had nothing listening on it — used to simulate a dead instance coming
+    back up, as opposed to a *new* instance appearing at a *new* address."""
+    port = port if port is not None else _free_port()
     config = uvicorn.Config(
         _mock_backend_app(concurrency), host="127.0.0.1", port=port, log_level="warning"
     )
@@ -252,8 +272,10 @@ def make_multi_backend_config(
     `min_concurrency`/`initial_concurrency`/`max_concurrency`/
     `target_p95_ms`/`timeout_rate_threshold`/`error_rate_threshold`). An
     optional `backup_upstream_urls` list configures the backend's failover
-    pool. Queue/timeout fields fall back to the same defaults as
-    `make_config`.
+    pool. An optional `health_check_interval_seconds` overrides the default
+    10s active-health-check cadence — useful for tests that need to observe
+    a recovered instance without a real 10s sleep. Queue/timeout fields fall
+    back to the same defaults as `make_config`.
     """
     backend_configs = []
     for b in backends:
@@ -272,6 +294,8 @@ def make_multi_backend_config(
         }
         if "backup_upstream_urls" in b:
             entry["backup_upstreams"] = [{"url": url} for url in b["backup_upstream_urls"]]
+        if "health_check_interval_seconds" in b:
+            entry["health_check_interval_seconds"] = b["health_check_interval_seconds"]
         if "sticky_sessions" in b:
             entry["sticky_sessions"] = b["sticky_sessions"]
         if "sticky_session_ttl_seconds" in b:

@@ -109,6 +109,30 @@ This is a diagnostic tool for a quick concurrency/backpressure smoke test — no
 real staging run with realistic concurrent-client counts against the real `page-search-api`/
 `image-search-api` backends, which needs real staging infrastructure to be meaningful.
 
+## Failover smoke test
+
+`scripts/smoke_test_failover.sh` automates the failover/failback verification that used to be done
+by hand (most recently for the backup-instances feature, by hand-authoring a throwaway
+`docker-compose.override.yml`): it stands up the AAC via Docker Compose against two stub backend
+containers (a primary and a backup, each a bare `python:3.12-slim` + `python -m http.server`
+serving a distinct static body), then asserts, over the wire:
+
+1. a baseline request is served by the primary,
+2. stopping the primary produces a `502` on the next request (marking it down) and then a `200`
+   from the backup on the request after that,
+3. restarting the primary and waiting past `health_check_interval_seconds` produces a `200` from
+   the primary again (failback).
+
+```bash
+scripts/smoke_test_failover.sh
+```
+
+It builds its own temporary config and `docker-compose.override.yml` (via `mktemp -d`), tears
+everything down on exit (success or failure) via a trap, and exits non-zero on any assertion
+failure — safe to run locally after touching `app/load_balancer.py` or `app/dispatcher.py`, and
+this is exactly what `.github/workflows/smoke.yml` runs on a weekly schedule and via manual
+`workflow_dispatch` (see [Development — Continuous integration](development.md#continuous-integration)).
+
 ## Production rollout
 
 This section is an operational runbook, not something the AAC automates. Every step below is an
