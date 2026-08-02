@@ -39,8 +39,13 @@ _HOP_BY_HOP_HEADERS = frozenset(
 )
 
 
-def _strip_hop_by_hop(headers: httpx.Headers) -> list[tuple[str, str]]:
-    return [(k, v) for k, v in headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS]
+def _strip_hop_by_hop(items: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`items` must already have repeated headers (e.g. multiple Set-Cookie)
+    preserved as separate entries — callers pass `Headers.items()` for the
+    Starlette request side (which already keeps duplicates separate) but
+    must pass `httpx.Headers.multi_items()`, not `.items()`, for the response
+    side, since httpx's `.items()` comma-joins same-name headers."""
+    return [(k, v) for k, v in items if k.lower() not in _HOP_BY_HOP_HEADERS]
 
 
 class BackendDispatcher:
@@ -87,7 +92,7 @@ class BackendDispatcher:
         upstream_request = self._client.build_request(
             method=request.method,
             url=url,
-            headers=_strip_hop_by_hop(request.headers),
+            headers=_strip_hop_by_hop(request.headers.items()),
             content=request.stream(),
         )
         upstream_response = await self._client.send(upstream_request, stream=True)
@@ -107,7 +112,7 @@ class BackendDispatcher:
         # (e.g. multiple Set-Cookie) down to one.
         response.raw_headers = [
             (k.encode("latin-1"), v.encode("latin-1"))
-            for k, v in _strip_hop_by_hop(upstream_response.headers)
+            for k, v in _strip_hop_by_hop(upstream_response.headers.multi_items())
         ]
         return upstream_response, response
 
