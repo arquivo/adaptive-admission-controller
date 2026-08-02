@@ -107,6 +107,7 @@ async def backend_upstreams(request: Request) -> Response:
                     "healthy": status.healthy,
                     "in_flight": status.in_flight,
                     "sticky_count": status.sticky_count,
+                    "is_backup": status.is_backup,
                 }
                 for status in load_balancer.snapshot()
             ],

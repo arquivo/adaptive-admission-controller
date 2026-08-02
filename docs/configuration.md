@@ -175,6 +175,7 @@ Fields common to every backend (`_BackendCommon` in `app/config.py`):
 |---|---|---|
 | `name` | string, unique | Identifies the backend everywhere — metrics labels, Redis penalty keys, `/admin/backends/{name}/...`. |
 | `upstreams` | non-empty list of `{url: http(s) URL}` | One or more physical instances of the same logical service. Only the scheme/host/port of each URL is used; the original request path and query string are forwarded unchanged (a drop-in replacement for an Apache `ProxyPass`). Duplicate URLs within one backend's list are rejected at load time. See [Multi-instance load balancing](#multi-instance-load-balancing) below for how requests are spread across more than one entry. |
+| `backup_upstreams` | list of `{url: http(s) URL}` | No effect while any `upstreams` entry is healthy — a pure emergency-standby pool used only once every primary instance is down. Empty by default. See [Backup instances](#backup-instances) below. |
 | `match.path_prefix` | string, unique | The path prefix this backend owns. Matching is longest-prefix-wins and path-segment-boundary aware, so `/noFrame/replay` and `/noFrame/patching` correctly resolve to distinct backends despite sharing a prefix. |
 | `connect_timeout_seconds` | float, > 0 | Upstream TCP connect timeout — shared across every instance in `upstreams` (instances are assumed equal-capacity clones of the same service, so there's no per-instance override). |
 | `backend_timeout_seconds` | float, > 0 | Upstream read/write timeout — a distinct concern from `queue_timeout_seconds` below, which only bounds *queue wait*, not backend response time. |
@@ -236,14 +237,45 @@ See [Known Limitations](known_limitations.md) for the scope this deliberately do
 sticky-session state is in-memory per-process, and a partial outage doesn't shrink the backend's
 overall admission limit).
 
+### Backup instances
+
+A backend can optionally configure `backup_upstreams` — a second tier of instances that receive
+traffic only once **every** entry in `upstreams` is unhealthy:
+
+```yaml
+  - name: pywb-noframe
+    upstreams: [{ url: http://pywb-noframe:8081 }]
+    backup_upstreams:
+      - url: http://pywb-noframe-standby:8081
+    match:
+      path_prefix: /noFrame/replay
+    ...
+```
+
+- **Trigger is health-only, never capacity.** Backups stay untouched while any primary instance is
+  healthy, even if every primary is fully saturated — primaries only ever redistribute load among
+  themselves in that case, exactly as without backups configured. Only a full primary outage (every
+  `upstreams` entry unhealthy) activates the backup pool.
+- **Selection, health checking, and sticky sessions are shared machinery**, not a separate code
+  path — once active, backups are selected by the same least-in-flight rule, participate in the
+  same passive/active health checking, and can be sticky-pinned the same way a primary can.
+- **Automatic failback.** Once a primary recovers, it's immediately eligible for selection again;
+  any client sticky-pinned to a backup is treated like a stale pin (its pinned instance is no
+  longer in the active candidate set) and is transparently rerouted to a primary on its very next
+  request — no separate eviction logic, no manual intervention.
+- If every instance — primary and backup alike — is unhealthy, selection fails open across the full
+  combined set, exactly as it does for primaries alone today.
+- `GET /admin/backends/{name}/upstreams` reports `is_backup` per instance so operators can tell
+  which tier each URL belongs to (see [API Reference](api_reference.md)).
+
 ### Config-level validation
 
 `AACConfig` (`app/config.py`) additionally enforces, at load time:
 
 - No two backends share a `name`.
 - No two backends share a `match.path_prefix`.
-- No backend's `upstreams` list contains a duplicate URL (compared after normalizing trailing
-  slashes).
+- No backend's combined `upstreams` + `backup_upstreams` contains a duplicate URL (compared after
+  normalizing trailing slashes) — including the same URL listed as both a primary and a backup.
 - Every key under `scoring.overrides` must name a backend that actually exists in `backends`.
 - `ingress.trusted_proxies` entries must each parse as a valid IP network.
 - `auth.enabled: true` requires both `auth.issuer` and `auth.jwks_url` to be set.

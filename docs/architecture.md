@@ -157,9 +157,18 @@ backend's `BackendDispatcher`; a single-instance backend degenerates to a no-op.
   is evicted only when its instance is at or above `fair_share` *and* a healthy alternative is
   strictly below it; if every instance is equally saturated, the pin is kept. Expired entries are
   swept on the same tick as `health_check_loop`, rather than adding a second background task.
-- **Observability**: `snapshot()` returns a per-instance `(url, healthy, in_flight, sticky_count)`
-  list, read by `GET /metrics` (gauges, at scrape time) and `GET /admin/backends/{name}/upstreams`
-  (see [API Reference](api_reference.md)).
+- **Observability**: `snapshot()` returns a per-instance `(url, healthy, in_flight, sticky_count,
+  is_backup)` list, read by `GET /metrics` (gauges, at scrape time) and `GET
+  /admin/backends/{name}/upstreams` (see [API Reference](api_reference.md)).
+- **Backup instances**: a backend may configure `backup_upstreams` alongside `upstreams`. Every
+  backup URL is folded into the same `_in_flight`/`_healthy`/`_hostports` dicts as primaries, so
+  everything above (selection, passive/active health checking, sticky pinning) already applies to
+  them with no separate code path. The only backup-specific logic is `_active_pool()`: healthy
+  primaries if any exist, else healthy backups, else fail-open across everything — called once at
+  the top of `select()`, before the existing sticky-lookup/least-loaded-pick logic runs unchanged
+  against whichever set it returns. Because `_pinned_instance()` already treats a pin whose
+  instance fell out of the candidate set as stale, a client pinned to a backup automatically
+  migrates back to a primary the moment that primary recovers — no separate failback code needed.
 
 See [Known Limitations](known_limitations.md) for what this deliberately leaves out of scope.
 

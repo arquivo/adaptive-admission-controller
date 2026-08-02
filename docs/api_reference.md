@@ -128,8 +128,8 @@ gauges above expose, but readable on demand without scraping `/metrics`:
   "backend": "pywb-framed",
   "sticky_sessions": true,
   "upstreams": [
-    { "url": "http://pywb-framed-1:8080/", "healthy": true, "in_flight": 2, "sticky_count": 5 },
-    { "url": "http://pywb-framed-2:8080/", "healthy": false, "in_flight": 0, "sticky_count": 0 }
+    { "url": "http://pywb-framed-1:8080/", "healthy": true, "in_flight": 2, "sticky_count": 5, "is_backup": false },
+    { "url": "http://pywb-framed-2:8080/", "healthy": false, "in_flight": 0, "sticky_count": 0, "is_backup": false }
   ]
 }
 ```
@@ -137,7 +137,9 @@ gauges above expose, but readable on demand without scraping `/metrics`:
 Same `404` behavior as the other two per-backend routes for an unknown name. `sticky_count` is how
 many clients currently have a live sticky pin to that instance — it does not itself expire pins,
 only reports the current in-memory state (see
-[Architecture — Instance selection](architecture.md#instance-selection)).
+[Architecture — Instance selection](architecture.md#instance-selection)). `is_backup` is `true` for
+an instance configured under `backup_upstreams` rather than `upstreams` — see [Configuration
+Reference — Backup instances](configuration.md#backup-instances).
 
 ## Diagnostic response headers
 

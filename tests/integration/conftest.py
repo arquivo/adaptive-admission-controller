@@ -250,8 +250,10 @@ def make_multi_backend_config(
     two — and either `concurrency_limit` (fixed controller, the default) or
     the full adaptive field set (`controller: "adaptive"` +
     `min_concurrency`/`initial_concurrency`/`max_concurrency`/
-    `target_p95_ms`/`timeout_rate_threshold`/`error_rate_threshold`).
-    Queue/timeout fields fall back to the same defaults as `make_config`.
+    `target_p95_ms`/`timeout_rate_threshold`/`error_rate_threshold`). An
+    optional `backup_upstream_urls` list configures the backend's failover
+    pool. Queue/timeout fields fall back to the same defaults as
+    `make_config`.
     """
     backend_configs = []
     for b in backends:
@@ -268,6 +270,8 @@ def make_multi_backend_config(
             "queue_timeout_seconds": b.get("queue_timeout_seconds", 30),
             "controller": b.get("controller", "fixed"),
         }
+        if "backup_upstream_urls" in b:
+            entry["backup_upstreams"] = [{"url": url} for url in b["backup_upstream_urls"]]
         if "sticky_sessions" in b:
             entry["sticky_sessions"] = b["sticky_sessions"]
         if "sticky_session_ttl_seconds" in b:

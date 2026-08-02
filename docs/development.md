@@ -49,6 +49,8 @@ No code change is required — this is purely a `config/backends.yaml` edit. Add
       - url: http://my-new-backend:8080
       # add more entries here for a horizontally-scaled backend — see
       # Configuration Reference — Multi-instance load balancing
+    # backup_upstreams:               # optional — see Configuration
+    #   - url: http://my-new-backend-standby:8080   # Reference — Backup instances
     match:
       path_prefix: /my-prefix
     controller: fixed          # or adaptive

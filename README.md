@@ -5,7 +5,8 @@ An async reverse proxy for [arquivo.pt](https://arquivo.pt) that sits between th
 per-backend concurrency control (fixed or adaptive), and keeps things fair under contention with a
 Redis-backed reputation score that prioritizes legitimate traffic — without ever hard-blocking a
 client outright. A backend can also be horizontally scaled across multiple upstream instances,
-load-balanced by available capacity with sticky sessions and automatic health-based failover.
+load-balanced by available capacity with sticky sessions and automatic health-based failover, plus
+an optional backup instance pool that only takes traffic once every primary instance is down.
 
 See [docs/overview.md](docs/overview.md) for the full picture, or jump straight to what you need:
 

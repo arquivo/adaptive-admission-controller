@@ -122,3 +122,49 @@ def test_multiple_upstreams_parse_in_order(base_config_dict):
         "http://page-search-api-1:8080/",
         "http://page-search-api-2:8080/",
     ]
+
+
+def test_backup_upstreams_defaults_to_empty_list(base_config_dict):
+    config = AACConfig.model_validate(base_config_dict)
+    assert config.backends[0].backup_upstreams == []
+
+
+def test_duplicate_url_within_backup_upstreams_fails(base_config_dict):
+    base_config_dict["backends"][0]["backup_upstreams"] = [
+        {"url": "http://page-search-api-backup:8080"},
+        {"url": "http://page-search-api-backup:8080"},
+    ]
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_url_duplicated_across_upstreams_and_backup_upstreams_fails(base_config_dict):
+    base_config_dict["backends"][0]["backup_upstreams"] = [
+        {"url": str(base_config_dict["backends"][0]["upstreams"][0]["url"])},
+    ]
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_url_duplicated_across_upstreams_and_backup_upstreams_trailing_slash_fails(
+    base_config_dict,
+):
+    base_config_dict["backends"][0]["upstreams"] = [{"url": "http://page-search-api-1:8080"}]
+    base_config_dict["backends"][0]["backup_upstreams"] = [
+        {"url": "http://page-search-api-1:8080/"}
+    ]
+    with pytest.raises(ValidationError):
+        AACConfig.model_validate(base_config_dict)
+
+
+def test_multiple_backup_upstreams_parse_in_order(base_config_dict):
+    base_config_dict["backends"][0]["backup_upstreams"] = [
+        {"url": "http://page-search-api-backup-1:8080"},
+        {"url": "http://page-search-api-backup-2:8080"},
+    ]
+    config = AACConfig.model_validate(base_config_dict)
+    backend = next(b for b in config.backends if b.name == "page-search-api")
+    assert [str(u.url) for u in backend.backup_upstreams] == [
+        "http://page-search-api-backup-1:8080/",
+        "http://page-search-api-backup-2:8080/",
+    ]

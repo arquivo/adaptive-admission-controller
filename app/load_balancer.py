@@ -6,9 +6,20 @@ Phase 1: pure least-in-flight selection. Phase 2 adds passive health
 tracking — a connection-level failure marks an instance down immediately,
 excluding it from selection — plus `health_check_loop()`, a periodic active
 TCP probe that brings a down instance back once it's reachable again.
-Phase 3 (this revision) adds sticky sessions: a client IP is pinned to the
-instance it last used, unless that instance is unhealthy or is at/above its
-fair share of capacity while a less-loaded healthy instance exists.
+Phase 3 adds sticky sessions: a client IP is pinned to the instance it last
+used, unless that instance is unhealthy or is at/above its fair share of
+capacity while a less-loaded healthy instance exists.
+
+Backup instances (this revision): a backend may configure `backup_upstreams`
+alongside `upstreams` — a second tier of instances that only receive traffic
+once every primary instance is unhealthy. Backup URLs share the same
+in-flight/health tracking as primaries (passive marking-down, active
+recovery probing, sticky pinning all apply identically), so the only new
+concept is `_active_pool()`: primaries if any are healthy, else backups if
+any are healthy, else fail open across everything. Because a stale sticky
+pin on a backup simply falls outside whatever `_active_pool()` returns once
+a primary recovers, clients migrate back to primaries automatically with no
+extra eviction logic.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ class LeastLoadedLoadBalancer(LoadBalancer):
         self,
         urls: list[str],
         *,
+        backup_urls: list[str] | None = None,
         connect_timeout_seconds: float = 5.0,
         health_check_interval_seconds: float = 10.0,
         sticky_enabled: bool = True,
@@ -44,11 +56,13 @@ class LeastLoadedLoadBalancer(LoadBalancer):
         capacity_hint: Callable[[], int] | None = None,
         now: Callable[[], float] = time.monotonic,
     ):
-        self._in_flight: dict[str, int] = dict.fromkeys(urls, 0)
-        self._healthy: dict[str, bool] = dict.fromkeys(urls, True)
+        all_urls = [*urls, *(backup_urls or [])]
+        self._backup_urls: frozenset[str] = frozenset(backup_urls or [])
+        self._in_flight: dict[str, int] = dict.fromkeys(all_urls, 0)
+        self._healthy: dict[str, bool] = dict.fromkeys(all_urls, True)
         self._marked_down_since: dict[str, float] = {}
         self._hostports: dict[str, tuple[str, int]] = {
-            url: self._parse_hostport(url) for url in urls
+            url: self._parse_hostport(url) for url in all_urls
         }
         self._connect_timeout_seconds = connect_timeout_seconds
         self._health_check_interval_seconds = health_check_interval_seconds
@@ -68,12 +82,7 @@ class LeastLoadedLoadBalancer(LoadBalancer):
 
     async def select(self, ctx: RequestContext) -> UpstreamInstance:
         async with self._lock:
-            candidates = {url: n for url, n in self._in_flight.items() if self._healthy[url]}
-            if not candidates:
-                # Fail open: every instance is down, but never invent a new
-                # rejection path here — a true full outage still surfaces
-                # via the existing 502/503 dispatch-error handling.
-                candidates = self._in_flight
+            candidates = self._active_pool()
 
             sticky_key = ctx.source_ip if self._sticky_enabled else None
             if sticky_key is not None:
@@ -89,6 +98,28 @@ class LeastLoadedLoadBalancer(LoadBalancer):
             if sticky_key is not None:
                 self._sticky[sticky_key] = (url, self._now())
             return UpstreamInstance(url=url)
+
+    def _active_pool(self) -> dict[str, int]:
+        """The pool `select()` currently draws from: healthy primaries if any
+        exist, else healthy backups, else every instance regardless of
+        health (fail-open — a true full outage still surfaces via the
+        existing 502/503 dispatch-error handling, never a new rejection
+        path). Caller must hold `self._lock`."""
+        primary = {
+            url: n
+            for url, n in self._in_flight.items()
+            if url not in self._backup_urls and self._healthy[url]
+        }
+        if primary:
+            return primary
+        backup = {
+            url: n
+            for url, n in self._in_flight.items()
+            if url in self._backup_urls and self._healthy[url]
+        }
+        if backup:
+            return backup
+        return self._in_flight
 
     def _pinned_instance(self, sticky_key: str, candidates: dict[str, int]) -> str | None:
         """Returns the client's pinned instance URL if it should still be
@@ -139,6 +170,7 @@ class LeastLoadedLoadBalancer(LoadBalancer):
                 healthy=self._healthy[url],
                 in_flight=in_flight,
                 sticky_count=sticky_counts[url],
+                is_backup=url in self._backup_urls,
             )
             for url, in_flight in self._in_flight.items()
         ]

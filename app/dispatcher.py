@@ -52,7 +52,7 @@ class BackendDispatcher:
     def __init__(self, config: BackendConfig, load_balancer: LoadBalancer):
         self._config = config
         self._load_balancer = load_balancer
-        instance_count = len(config.upstreams)
+        instance_count = len(config.upstreams) + len(config.backup_upstreams)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=config.connect_timeout_seconds,

@@ -68,7 +68,10 @@ rather than silently assumed:
   `backend_timeout_seconds` apply identically to every entry in a backend's `upstreams` — there is
   no way to give one instance a longer timeout than its siblings. This is consistent with the
   no-per-instance-weight design decision (instances are assumed to be equal-capacity clones of the
-  same service); a genuinely heterogeneous fleet behind one backend name isn't supported.
+  same service); a genuinely heterogeneous fleet behind one backend name isn't supported. This
+  extends to `backup_upstreams`: a backup instance shares the same `connect_timeout_seconds`/
+  `backend_timeout_seconds`/`health_check_interval_seconds` as its primaries — there is no separate,
+  more-lenient cadence or timeout for the standby tier.
 
 ## Everything else is resolved
 

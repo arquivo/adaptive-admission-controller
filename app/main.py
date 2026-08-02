@@ -93,6 +93,7 @@ def _build_lifespan(preloaded_config: AACConfig | None):
         app.state.load_balancers = {
             backend.name: LeastLoadedLoadBalancer(
                 [str(u.url) for u in backend.upstreams],
+                backup_urls=[str(u.url) for u in backend.backup_upstreams],
                 connect_timeout_seconds=backend.connect_timeout_seconds,
                 health_check_interval_seconds=backend.health_check_interval_seconds,
                 sticky_enabled=backend.sticky_sessions,

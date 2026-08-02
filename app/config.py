@@ -180,6 +180,9 @@ class UpstreamConfig(BaseModel):
 class _BackendCommon(BaseModel):
     name: str
     upstreams: list[UpstreamConfig] = Field(min_length=1)
+    # Only used once every entry in `upstreams` is unhealthy — see
+    # docs/configuration.md "Multi-instance load balancing" > "Backup instances".
+    backup_upstreams: list[UpstreamConfig] = Field(default_factory=list)
     match: MatchConfig
     connect_timeout_seconds: float = Field(gt=0)
     backend_timeout_seconds: float = Field(gt=0)
@@ -189,16 +192,17 @@ class _BackendCommon(BaseModel):
     sticky_sessions: bool = True
     sticky_session_ttl_seconds: float = Field(default=300, gt=0)
 
-    @field_validator("upstreams")
-    @classmethod
-    def _check_unique_upstreams(cls, value: list[UpstreamConfig]) -> list[UpstreamConfig]:
+    @model_validator(mode="after")
+    def _check_unique_upstreams(self) -> _BackendCommon:
         seen: set[str] = set()
-        for upstream in value:
+        for upstream in [*self.upstreams, *self.backup_upstreams]:
             key = str(upstream.url).rstrip("/")
             if key in seen:
-                raise ValueError(f"duplicate upstream url in `upstreams`: {upstream.url}")
+                raise ValueError(
+                    f"duplicate upstream url across `upstreams`/`backup_upstreams`: {upstream.url}"
+                )
             seen.add(key)
-        return value
+        return self
 
 
 class FixedBackendConfig(_BackendCommon):

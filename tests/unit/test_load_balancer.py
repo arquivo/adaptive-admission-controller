@@ -251,3 +251,68 @@ async def test_snapshot_reports_sticky_count_per_instance():
     await lb.select(_ctx(source_ip="2.2.2.2"))
     counts = {s.url: s.sticky_count for s in lb.snapshot()}
     assert sum(counts.values()) == 2
+
+
+async def test_backup_gets_no_traffic_while_primary_healthy_even_when_saturated():
+    lb = LeastLoadedLoadBalancer(["http://a:8080"], backup_urls=["http://backup:8080"])
+    # The lone primary is healthy but increasingly saturated — backups must
+    # still not be touched, confirming the health-only (not capacity
+    # overflow) trigger.
+    for _ in range(5):
+        selected = await lb.select(_ctx())
+        assert selected.url == "http://a:8080"
+
+
+async def test_all_primaries_down_routes_to_least_loaded_healthy_backup():
+    lb = LeastLoadedLoadBalancer(
+        ["http://a:8080"], backup_urls=["http://backup1:8080", "http://backup2:8080"]
+    )
+    primary = await lb.select(_ctx())
+    await lb.release(primary, connect_failed=True)  # marks the only primary down
+
+    first = await lb.select(_ctx())
+    assert first.url in {"http://backup1:8080", "http://backup2:8080"}
+    second = await lb.select(_ctx())
+    assert second.url in {"http://backup1:8080", "http://backup2:8080"}
+    # Least-loaded selection still applies across backups.
+    assert first.url != second.url
+
+
+async def test_fails_open_across_combined_set_when_primaries_and_backups_down():
+    lb = LeastLoadedLoadBalancer(["http://a:8080"], backup_urls=["http://backup:8080"])
+    primary = await lb.select(_ctx())
+    await lb.release(primary, connect_failed=True)
+    backup = await lb.select(_ctx())
+    await lb.release(backup, connect_failed=True)
+
+    selected = await lb.select(_ctx())
+    assert selected.url in {"http://a:8080", "http://backup:8080"}
+
+
+async def test_sticky_pin_on_backup_auto_migrates_back_to_primary_on_recovery():
+    lb = LeastLoadedLoadBalancer(
+        ["http://a:8080"], backup_urls=["http://backup:8080"], capacity_hint=lambda: 100
+    )
+    ctx = _ctx(source_ip="1.2.3.4")
+    primary = await lb.select(ctx)
+    assert primary.url == "http://a:8080"
+    await lb.release(primary, connect_failed=True)  # fails the only primary over
+
+    pinned_to_backup = await lb.select(ctx)
+    assert pinned_to_backup.url == "http://backup:8080"
+    await lb.release(pinned_to_backup, connect_failed=False)
+
+    async with lb._lock:
+        lb._healthy["http://a:8080"] = True  # simulate the primary recovering
+
+    # The client's sticky pin on the backup is now stale — `_active_pool()`
+    # returns primaries again, so the pin falls outside `candidates` and
+    # selection reroutes back to the recovered primary automatically.
+    migrated = await lb.select(ctx)
+    assert migrated.url == "http://a:8080"
+
+
+async def test_snapshot_reports_is_backup_flag_per_instance():
+    lb = LeastLoadedLoadBalancer(["http://a:8080"], backup_urls=["http://backup:8080"])
+    by_url = {s.url: s.is_backup for s in lb.snapshot()}
+    assert by_url == {"http://a:8080": False, "http://backup:8080": True}

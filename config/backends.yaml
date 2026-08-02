@@ -145,6 +145,13 @@ backends:
 
   - name: pywb-noframe
     upstreams: [{ url: http://pywb-noframe:8081 }]
+    # Illustrative backup-instance example: only used once every entry above
+    # in `upstreams` is unhealthy — a pure emergency-standby pool, never
+    # preferred just because the primary is saturated. See
+    # docs/configuration.md "Multi-instance load balancing" > "Backup
+    # instances".
+    backup_upstreams:
+      - url: http://pywb-noframe-standby:8081
     match:
       path_prefix: /noFrame/replay
     controller: fixed

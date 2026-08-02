@@ -135,6 +135,7 @@ class InstanceStatus:
     healthy: bool
     in_flight: int
     sticky_count: int = 0
+    is_backup: bool = False
 
 
 class LoadBalancer(ABC):

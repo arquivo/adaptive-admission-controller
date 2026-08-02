@@ -111,3 +111,35 @@ async def test_dead_instance_marked_down_then_traffic_shifts_to_live_instance():
                 response = await client.get("/proxytest/echo")
                 assert response.status_code == 200
 
+
+async def test_all_primaries_down_traffic_fails_over_to_backup_instance():
+    dead_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    dead_sock.bind(("127.0.0.1", 0))
+    dead_port = dead_sock.getsockname()[1]
+    dead_sock.close()
+    dead_url = f"http://127.0.0.1:{dead_port}"
+
+    async with _running_mock_backend({"current": 0, "max": 0}) as backup_url:
+        config = make_multi_backend_config(
+            [
+                {
+                    "name": "multi-backend",
+                    "upstream_url": dead_url,
+                    "backup_upstream_urls": [backup_url],
+                    "path_prefix": "/proxytest",
+                    "concurrency_limit": 100,
+                    "connect_timeout_seconds": 0.2,
+                }
+            ]
+        )
+        async with running_app(config) as (_app, client):
+            # The only primary is dead — the first request hits it, fails,
+            # and marks it down.
+            first = await client.get("/proxytest/echo")
+            assert first.status_code == 502
+
+            # With no healthy primary left, traffic now fails over to the
+            # backup instance instead of continuing to 502.
+            second = await client.get("/proxytest/echo")
+            assert second.status_code == 200
+
