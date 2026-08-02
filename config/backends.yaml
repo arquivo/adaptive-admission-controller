@@ -73,16 +73,6 @@ scoring:
       - { window_seconds: 60, soft_threshold: 50, hard_threshold: 200, soft_penalty: 5, hard_penalty: 40 }
       - { window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60 } # best-guess default — tune with production data
 
-  # Per-backend overrides: deep-merge over default_penalties/base_scores above.
-  # Only list the fields/dimensions a backend needs to diverge on.
-  overrides:
-    page-search-api:
-      penalties:
-        ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
-    image-search-api:
-      penalties:
-        ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
-
 backends:
   # --- Search APIs (2 independent services, separate hardware/collections;
   # each talks to its own SolrCloud cluster internally) ---
@@ -101,6 +91,13 @@ backends:
     backend_timeout_seconds: 60
     queue_max_size: 5000
     queue_timeout_seconds: 300
+    # Per-backend scoring override: deep-merges over scoring.default_penalties/
+    # base_scores above. Only list the fields/dimensions this backend needs to
+    # diverge on.
+    scoring:
+      overrides:
+        penalties:
+          ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
 
   - name: image-search-api
     upstreams: [{ url: http://image-search-api:8080 }] # environment-specific — see docs/open_tbd.md
@@ -117,6 +114,10 @@ backends:
     backend_timeout_seconds: 60
     queue_max_size: 5000
     queue_timeout_seconds: 300
+    scoring:
+      overrides:
+        penalties:
+          ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
 
   # --- pywb (4 independent uwsgi processes, own port each) ---
   - name: pywb-framed

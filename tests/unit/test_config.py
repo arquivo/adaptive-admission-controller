@@ -59,16 +59,14 @@ def test_duplicate_path_prefix_fails(base_config_dict):
         AACConfig.model_validate(base_config_dict)
 
 
-def test_unknown_override_backend_name_fails(base_config_dict):
-    base_config_dict["scoring"]["overrides"]["does-not-exist"] = {
-        "penalties": {"ip": {"soft_threshold": 1}}
-    }
-    with pytest.raises(ValidationError):
-        AACConfig.model_validate(base_config_dict)
+def test_backend_without_scoring_override_defaults_to_none(base_config_dict):
+    config = AACConfig.model_validate(base_config_dict)
+    backend = next(b for b in config.backends if b.name == "pywb-framed")
+    assert backend.scoring is None
 
 
 def test_unknown_override_dimension_fails(base_config_dict):
-    base_config_dict["scoring"]["overrides"]["page-search-api"]["penalties"]["bogus"] = {
+    base_config_dict["backends"][0]["scoring"]["overrides"]["penalties"]["bogus"] = {
         "soft_threshold": 1
     }
     with pytest.raises(ValidationError):

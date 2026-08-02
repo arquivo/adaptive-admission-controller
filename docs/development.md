@@ -65,8 +65,8 @@ See [Configuration Reference — `backends`](configuration.md#backends) for the 
 the discriminated `fixed`/`adaptive` shape. Startup validation will reject a duplicate `name` or
 `match.path_prefix` automatically.
 
-If the backend needs its own scoring thresholds, add a matching entry under
-`scoring.overrides.<name>` — see [Configuration Reference — `scoring`](configuration.md#scoring).
+If the backend needs its own scoring thresholds, add a matching `scoring.overrides` block to its
+`backends:` entry — see [Configuration Reference — `backends`](configuration.md#backends).
 
 ## Adding a new scoring dimension
 

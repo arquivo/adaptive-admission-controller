@@ -117,7 +117,8 @@ observability:
 
 ### `scoring`
 
-Global defaults plus per-backend overrides for the reputation-scoring formula (`app/scoring.py`).
+Global defaults for the reputation-scoring formula (`app/scoring.py`); per-backend overrides live
+inline on each backend (see [`backends`](#backends) below).
 
 ```yaml
 scoring:
@@ -142,11 +143,6 @@ scoring:
     user:
       - { window_seconds: 60, soft_threshold: 50, hard_threshold: 200, soft_penalty: 5, hard_penalty: 40 }
       - { window_seconds: 3600, soft_threshold: 500, hard_threshold: 2000, soft_penalty: 10, hard_penalty: 60 }
-
-  overrides:
-    page-search-api:
-      penalties:
-        ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 }
 ```
 
 | Field | Type | Required | Description |
@@ -156,7 +152,6 @@ scoring:
 | `base_scores` | map of `UserClass` value → int | yes | Starting score per identity class, before any penalty is subtracted. Keys must be `anonymous`, `researcher`, `service_account`, `internal`, `unknown`. |
 | `score_clamp.min` / `score_clamp.max` | int | yes | Final score is clamped to this range after penalties are subtracted. |
 | `default_penalties.<dimension>` | list of penalty windows | yes, one non-empty list per dimension | Dimensions: `ip`, `net24`, `net6`, `asn`, `country`, `user`. Each dimension can carry more than one independent window (e.g. `user` has both a 60s burst window and a 3600s sustained-abuse window) — every window's step function is evaluated and their penalties are summed. |
-| `overrides.<backend-name>` | `penalties` + `base_scores` maps | no | Per-backend deep-merge over the global defaults above — a backend touching only one field/dimension leaves everything else (other dimensions, other backends) unchanged. `overrides` keys must name a backend actually listed in `backends` below, or config validation fails. |
 
 Each penalty window (`PenaltyConfig`) has five fields, all required: `window_seconds` (> 0),
 `soft_threshold` (≥ 0), `hard_threshold` (≥ 0, must be ≥ `soft_threshold`), `soft_penalty` (≥ 0),
@@ -184,6 +179,7 @@ Fields common to every backend (`_BackendCommon` in `app/config.py`):
 | `health_check_interval_seconds` | float, > 0 | No effect for a single-instance backend. For a multi-instance backend, how often instances currently marked down are re-probed for recovery. Default `10`. |
 | `sticky_sessions` | bool | No effect for a single-instance backend. For a multi-instance backend, whether repeat requests from the same client IP are pinned to the same instance. Default `true`. |
 | `sticky_session_ttl_seconds` | float, > 0 | No effect when `sticky_sessions` is `false` or there's only one instance. How long a client's pin is kept after its last use before being dropped. Default `300`. |
+| `scoring.overrides` | `penalties` + `base_scores` maps | no | Per-backend deep-merge over the global `scoring` defaults above — a backend touching only one field/dimension leaves everything else (other dimensions, other backends) unchanged. Omit `scoring` entirely for a backend that has no divergence from the global defaults. Example: `scoring: { overrides: { penalties: { ip: { soft_threshold: 5, hard_threshold: 15, soft_penalty: 15, hard_penalty: 50 } } } }`. |
 
 **`controller: fixed`** additionally requires:
 
@@ -276,7 +272,6 @@ traffic only once **every** entry in `upstreams` is unhealthy:
 - No two backends share a `match.path_prefix`.
 - No backend's combined `upstreams` + `backup_upstreams` contains a duplicate URL (compared after
   normalizing trailing slashes) — including the same URL listed as both a primary and a backup.
-- Every key under `scoring.overrides` must name a backend that actually exists in `backends`.
 - `ingress.trusted_proxies` entries must each parse as a valid IP network.
 - `auth.enabled: true` requires both `auth.issuer` and `auth.jwks_url` to be set.
 

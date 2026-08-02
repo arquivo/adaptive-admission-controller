@@ -88,28 +88,6 @@ _BASE_CONFIG: dict = {
                 },
             ],
         },
-        "overrides": {
-            "page-search-api": {
-                "penalties": {
-                    "ip": {
-                        "soft_threshold": 5,
-                        "hard_threshold": 15,
-                        "soft_penalty": 15,
-                        "hard_penalty": 50,
-                    }
-                }
-            },
-            "image-search-api": {
-                "penalties": {
-                    "ip": {
-                        "soft_threshold": 5,
-                        "hard_threshold": 15,
-                        "soft_penalty": 15,
-                        "hard_penalty": 50,
-                    }
-                }
-            },
-        },
     },
     "backends": [
         {
@@ -127,6 +105,18 @@ _BASE_CONFIG: dict = {
             "backend_timeout_seconds": 60,
             "queue_max_size": 5000,
             "queue_timeout_seconds": 300,
+            "scoring": {
+                "overrides": {
+                    "penalties": {
+                        "ip": {
+                            "soft_threshold": 5,
+                            "hard_threshold": 15,
+                            "soft_penalty": 15,
+                            "hard_penalty": 50,
+                        }
+                    }
+                }
+            },
         },
         {
             "name": "image-search-api",
@@ -143,6 +133,18 @@ _BASE_CONFIG: dict = {
             "backend_timeout_seconds": 60,
             "queue_max_size": 5000,
             "queue_timeout_seconds": 300,
+            "scoring": {
+                "overrides": {
+                    "penalties": {
+                        "ip": {
+                            "soft_threshold": 5,
+                            "hard_threshold": 15,
+                            "soft_penalty": 15,
+                            "hard_penalty": 50,
+                        }
+                    }
+                }
+            },
         },
         {
             "name": "pywb-framed",

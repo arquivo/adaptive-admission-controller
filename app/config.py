@@ -151,11 +151,14 @@ class ScoringConfig(BaseModel):
     base_scores: dict[str, int]
     score_clamp: ScoreClamp
     default_penalties: DefaultPenalties
-    overrides: dict[str, BackendOverride] = Field(default_factory=dict)
+
+
+class BackendScoring(BaseModel):
+    overrides: BackendOverride = BackendOverride()
 
 
 class ResolvedScoringConfig(BaseModel):
-    """A single backend's scoring config after `scoring.overrides.<backend>`
+    """A single backend's scoring config after `backend.scoring.overrides`
     has been deep-merged into `scoring.default_penalties`/`base_scores`.
 
     Computed once at startup (see `resolve_scoring_config` below) and cached
@@ -191,6 +194,7 @@ class _BackendCommon(BaseModel):
     health_check_interval_seconds: float = Field(default=10, gt=0)
     sticky_sessions: bool = True
     sticky_session_ttl_seconds: float = Field(default=300, gt=0)
+    scoring: BackendScoring | None = None
 
     @model_validator(mode="after")
     def _check_unique_upstreams(self) -> _BackendCommon:
@@ -243,12 +247,6 @@ class AACConfig(BaseModel):
         if len(prefixes) != len(set(prefixes)):
             raise ValueError("duplicate `match.path_prefix` in `backends`")
 
-        name_set = set(names)
-        for override_name in self.scoring.overrides:
-            if override_name not in name_set:
-                raise ValueError(
-                    f"scoring.overrides references unknown backend: {override_name!r}"
-                )
         return self
 
 
@@ -258,8 +256,8 @@ def load_config(path: Path) -> AACConfig:
     return AACConfig.model_validate(raw)
 
 
-def resolve_scoring_config(scoring: ScoringConfig, backend_name: str) -> ResolvedScoringConfig:
-    """Deep-merge `scoring.overrides.<backend_name>` into
+def resolve_scoring_config(scoring: ScoringConfig, backend: BackendConfig) -> ResolvedScoringConfig:
+    """Deep-merge `backend.scoring.overrides` into
     `scoring.default_penalties`/`base_scores`. A backend override touching
     only one dimension/field leaves everything else — other dimensions,
     other backends — unchanged.
@@ -269,7 +267,7 @@ def resolve_scoring_config(scoring: ScoringConfig, backend_name: str) -> Resolve
     `scoring.default_penalties`, silently corrupting every other backend
     resolved afterwards.
     """
-    override = scoring.overrides.get(backend_name)
+    override = backend.scoring.overrides if backend.scoring else None
 
     defaults_dump = scoring.default_penalties.model_dump()
     penalties: dict[str, list[PenaltyConfig]] = {}

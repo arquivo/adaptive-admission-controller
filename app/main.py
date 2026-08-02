@@ -70,7 +70,7 @@ def _build_lifespan(preloaded_config: AACConfig | None):
         app.state.score_engine = ScoreEngine(
             app.state.penalty_store,
             {
-                backend.name: resolve_scoring_config(config.scoring, backend.name)
+                backend.name: resolve_scoring_config(config.scoring, backend)
                 for backend in config.backends
             },
         )

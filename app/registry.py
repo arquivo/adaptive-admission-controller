@@ -51,7 +51,7 @@ class BackendPolicyRegistry:
     def __init__(self, config: AACConfig, geoip: GeoIPLookup, auth: JWTVerifier):
         self._policies: dict[str, DefaultBackendPolicy] = {
             backend.name: DefaultBackendPolicy(
-                backend, resolve_scoring_config(config.scoring, backend.name), geoip, auth
+                backend, resolve_scoring_config(config.scoring, backend), geoip, auth
             )
             for backend in config.backends
         }
