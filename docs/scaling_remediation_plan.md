@@ -79,27 +79,38 @@ be sufficient on their own.
 
 **Update 2026-08-03, post item 4:** the real load test found CPU-bound contention (single process
 pinned at 110-165% CPU, throughput *dropping* as offered concurrency rose past ~100-150 with 0%
-rejections throughout) — but traced it to `app/capacity.py`'s `FixedController`/
+rejections throughout). The initial hypothesis was `app/capacity.py`'s `FixedController`/
 `AdaptiveController` using a shared `asyncio.Condition` per backend whose `release()` calls
 `notify_all()`, waking every blocked waiter on every completed request regardless of how many can
-actually proceed (a wake-storm that scales with queue depth, not with real work). That's a
-single-process algorithmic inefficiency, not inherent single-core saturation from legitimate
-request-handling work (the stub backend itself answered in single-digit milliseconds throughout).
-Full details and numbers: `docs/deployment.md`'s new subsection.
+actually proceed (a wake-storm scaling with queue depth) — **this has since been ruled out, see the
+next update.** Full details and numbers: `docs/deployment.md`'s "Local load-test results" subsection.
 
-Practical implication: **item 5 (multi-process scale-out) is not yet justified by this data** —
-multiplying a process that's wasting CPU on wake-storms wouldn't fix the underlying inefficiency,
-just add more processes each hitting the same per-backend wall around ~100-150 concurrent in-flight
-requests. The cheaper, smaller candidate fix worth considering first: replace the `Condition`-based
-acquire/release in `app/capacity.py` with a synchronization primitive that wakes only as many
-waiters as can proceed (e.g. `asyncio.Semaphore`, whose `release()` wakes exactly one FIFO waiter)
-rather than all of them. That's a targeted change to `app/capacity.py` (and its tests in
-`tests/unit/test_capacity.py`), not the sticky-session-to-Redis migration or per-worker lifespan
-questions below — but it's still outside the code changes items 1-4 were scoped to make, so it
-wasn't implemented as part of this remediation plan without separately confirming that scope
-expansion. If pursued, it should be re-measured with the same `scripts/load_test.py` methodology
-before item 5's bigger question (multi-process, which still needs the sticky-session-state
-migration and per-worker lifespan sign-off below) is revisited.
+**Update 2026-08-03, after implementing and measuring the wake-storm fix:** the candidate fix
+(`release()` calling `notify(cost)` instead of `notify_all()`) was implemented and tested
+(`app/capacity.py`, `tests/unit/test_capacity.py`), then re-measured with the same load-test
+methodology. Result: **no measurable improvement** at any concurrency level. Root cause: `app/main.py`
+starts exactly one `run_worker()` task per backend, so at most one waiter can ever be blocked on a
+given backend's condition at a time — `notify_all()` and `notify(cost)` are functionally equivalent
+here regardless of queue depth. The wake-storm theory assumed multiple concurrent waiters per
+backend, which this codebase's architecture doesn't allow. The `notify(cost)` change is kept as a
+harmless correctness improvement (more precise, and it guards against a future change that adds more
+worker tasks per backend), but it isn't the fix for the measured inversion.
+
+**Update 2026-08-03, real profiling with `py-spy`:** since `cProfile` gives unreliable results for
+asyncio code (it misattributes idle/I/O-wait time and inflates call counts around every `await`),
+profiling was redone with `py-spy`, a sampling profiler, attached cross-container via a shared PID
+namespace (neither `pip` nor `py-spy` are available in the slim runtime image). Findings: the process
+runs on a **single OS thread**, and CPU-active time during a degraded run is spread thin across
+dozens of call sites (anyio bookkeeping, httpcore, JSON structured logging, starlette middleware),
+none above ~2% — **no single hot function to optimize away.** Full details:
+`docs/deployment.md`'s "Local load-test results" subsection.
+
+Practical implication: this now points to genuine single-core saturation from cumulative per-request
+overhead across the whole async stack, not an algorithmic bug — **item 5 (multi-process scale-out) is
+now justified by this data**, matching this section's original framing before the wake-storm detour.
+There's no cheaper `app/capacity.py`-sized fix left to try; the next step is scoping item 5 itself
+(sticky-session-to-Redis migration, per-worker lifespan questions, product sign-off — see below),
+which is a larger piece of work than this remediation plan's items 1-4 covered.
 
 Prerequisite: move `LeastLoadedLoadBalancer`'s sticky-session state (client-IP → pinned-instance
 map, currently in-process memory per `known_limitations.md`'s "Multi-instance load balancing scope

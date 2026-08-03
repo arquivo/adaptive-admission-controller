@@ -66,7 +66,15 @@ class FixedController(CapacityController):
             self._in_flight -= cost
             if not timed_out and status_code < 500:
                 self._latency.record(latency_ms)
-            self._condition.notify_all()  # a slot just freed — wake any waiter that now fits
+            # Bounded to `cost`, not notify_all(): at most `cost` waiters (each
+            # needing cost=1, decision log A3 — see app/registry.py's
+            # estimate_cost()) can newly fit after this release. notify_all()
+            # here was an O(waiters) wake-storm on every completed request —
+            # the measured cause of the CPU-bound throughput inversion in
+            # docs/deployment.md's load-test results. Revisit if `cost` ever
+            # becomes non-uniform (a smaller-cost waiter behind a larger one
+            # could then be starved by under-waking).
+            self._condition.notify(cost)
 
     def current_limit(self) -> int:
         return self._limit
@@ -135,7 +143,15 @@ class AdaptiveController(CapacityController):
             self._errors.record(status_code >= 500 and not timed_out)
             if not timed_out and status_code < 500:
                 self._latency.record(latency_ms)
-            self._condition.notify_all()  # a slot just freed — wake any waiter that now fits
+            # Bounded to `cost`, not notify_all(): at most `cost` waiters (each
+            # needing cost=1, decision log A3 — see app/registry.py's
+            # estimate_cost()) can newly fit after this release. notify_all()
+            # here was an O(waiters) wake-storm on every completed request —
+            # the measured cause of the CPU-bound throughput inversion in
+            # docs/deployment.md's load-test results. Revisit if `cost` ever
+            # becomes non-uniform (a smaller-cost waiter behind a larger one
+            # could then be starved by under-waking).
+            self._condition.notify(cost)
 
     def current_limit(self) -> int:
         return self._limit

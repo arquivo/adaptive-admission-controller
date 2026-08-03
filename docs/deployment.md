@@ -214,28 +214,56 @@ and it isn't FD exhaustion (`/proc/net/sockstat` showed ~100 TCP sockets in use 
 during the degraded runs, confirming this is CPU-bound contention inside the process itself, not a
 resource ceiling from items 1-2.
 
-The likely mechanism: `app/capacity.py`'s `FixedController`/`AdaptiveController.acquire()`/
-`release()` are built on a single shared `asyncio.Condition` per backend, and `release()` calls
-`notify_all()` on every completed request — waking *every* currently-blocked waiter so each can
-re-acquire the condition's lock and re-check its predicate, even though only one (at most a few) can
-actually proceed. As offered concurrency grows past the configured `concurrency_limit`, the number
-of waiters woken per release grows with it, so the overhead of *rejecting* wake-ups scales with
-however many clients are queued — a wake-storm, not useful work. This wasn't something the original
-items 1-4 (FD limits, Redis pool sizing, load-test tooling) were scoped to touch; it surfaced only
-because item 4 asked to actually run a real load test and look at what breaks first.
+**Initial hypothesis (since revised — see the updates below):** `app/capacity.py`'s
+`FixedController`/`AdaptiveController.acquire()`/`release()` are built on a single shared
+`asyncio.Condition` per backend, and `release()` called `notify_all()` on every completed request —
+waking *every* currently-blocked waiter even though only one (at most a few) could actually proceed.
+This looked like an `O(waiters)` wake-storm that would scale with queue depth. This wasn't something
+the original items 1-4 (FD limits, Redis pool sizing, load-test tooling) were scoped to touch; it
+surfaced only because item 4 asked to actually run a real load test and look at what breaks first.
 
 Two production backends (`page-search-api`, `image-search-api`) already configure `max_concurrency:
 300` in the table above — per this measurement, either one approaching that ceiling in real traffic
 would hit the same wall this test found at a single backend's ~150 concurrent in-flight requests,
 well before reaching its own configured limit.
 
-Feeding this back into `docs/scaling_remediation_plan.md`'s item 5 section: **this is CPU-bound
-contention, but not the kind item 5 (multi-worker/multi-process scale-out) was written to address.**
-It's a single-process algorithmic inefficiency (an `O(waiters)` wake-storm on every release), not
-inherent single-core saturation from legitimate request-handling work — the actual proxied requests
-in these runs were fast (the stub backend answered in single-digit milliseconds). A synchronization
-primitive that wakes only the waiters that can actually proceed (e.g. an `asyncio.Semaphore`, whose
-`release()` wakes exactly one waiter in FIFO order, rather than a `Condition` + `notify_all()`) is a
-much smaller, cheaper fix than multi-process scale-out, and would need to land and be re-measured
-before item 5's bigger, product-sign-off-gated question (sticky-session state needing to move to
-Redis, per-worker lifespan duplication) is worth revisiting at all.
+**Update 2026-08-03, after implementing and measuring the wake-storm fix:** `release()` was changed
+to `notify(cost)` — bounded to exactly the capacity that just freed up, instead of waking every
+waiter (see `app/capacity.py` and its regression tests in `tests/unit/test_capacity.py`) — and
+re-measured with the same A/B methodology (toggling the change via `git stash`, rebuilding the image,
+identical load sweeps, `docker stats` sampled *concurrently* with the load rather than after, and
+`concurrency_limit` set deliberately below the offered range to force real contention). Result:
+**no measurable difference** in throughput or CPU behavior at any concurrency level tested.
+
+Re-reading `app/main.py`/`app/scheduler.py` explains why: exactly one `run_worker()` task exists per
+backend, so at most one waiter can ever be blocked on a given backend's `asyncio.Condition` at a
+time — `notify_all()` and `notify(cost)` wake the same number of waiters (at most one) in this
+codebase's actual architecture. The wake-storm theory assumed multiple concurrent waiters per
+backend; that assumption doesn't hold here. The `notify(cost)` change has been kept anyway as a
+harmless correctness improvement — it's still the more precise call, and it guards against a future
+change that adds more worker tasks per backend — but it does not explain or fix the measured
+throughput inversion.
+
+**Update 2026-08-03, real profiling with `py-spy`:** `cProfile` was tried first and produced
+misleading data — it fundamentally miscounts asyncio code, attributing idle/blocked-on-I/O time to
+whatever frame happened to be active when the event loop suspended, and inflating call counts because
+every `await` suspend/resume registers as a fresh call/return event to a frame-based profiler.
+Switching to `py-spy` (a sampling profiler that isn't fooled by cooperative yielding — attached
+cross-container via a shared PID namespace, since neither `pip` nor `py-spy` are available in the
+slim runtime image) gave a trustworthy picture instead:
+
+- The process runs on a **single OS thread** throughout — `py-spy dump` never showed more than one.
+- During a degraded 200-concurrency run, only ~20% of wall-clock samples were CPU-active (the rest
+  genuinely idle on I/O), and that active time was spread thin across dozens of call sites — anyio
+  task/timeout bookkeeping, httpcore connection handling, JSON structured logging, starlette's
+  middleware chain — none individually above ~2% of samples. **There is no single hot function to
+  optimize away.**
+
+That points to genuine **single-core saturation from cumulative per-request overhead** across the
+full async stack (middleware, scoring, structured logging, metrics), not an algorithmic bug — one OS
+thread can only do so much Python-level work per second, and at 100-250 concurrent in-flight requests
+the aggregate work needed for all of them competes for that same thread. This matches
+`docs/scaling_remediation_plan.md`'s item 5 as originally framed (before the wake-storm detour):
+multi-process scale-out, not a targeted `app/capacity.py` fix, is the change that would actually raise
+this ceiling — see that item for the updated status and its prerequisites (sticky-session state
+migration, per-worker lifespan questions, product sign-off).

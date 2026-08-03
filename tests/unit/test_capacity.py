@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -93,6 +94,50 @@ async def test_fixed_controller_release_wakes_only_when_slot_fits():
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
+
+
+async def test_fixed_controller_release_wakes_bounded_number_of_waiters():
+    """A single release(1) frees exactly one slot, so it must admit exactly
+    one of several queued cost=1 waiters, not all of them (the notify_all()
+    wake-storm this guards against — docs/deployment.md's load-test results)."""
+    controller = FixedController(limit=1)
+    await controller.acquire(1)
+
+    waiters = [asyncio.ensure_future(controller.acquire(1)) for _ in range(3)]
+
+    await controller.release(1, latency_ms=1.0, status_code=200, timed_out=False)
+    done, pending = await asyncio.wait(waiters, timeout=0.05)
+    assert len(done) == 1
+    assert len(pending) == 2
+
+    await controller.release(1, latency_ms=1.0, status_code=200, timed_out=False)
+    done2, pending2 = await asyncio.wait(pending, timeout=0.05)
+    assert len(done2) == 1
+    assert len(pending2) == 1
+
+    for waiter in pending2:
+        waiter.cancel()
+    for waiter in pending2:
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+
+async def test_fixed_controller_release_calls_notify_with_cost_not_notify_all():
+    controller = FixedController(limit=2)
+    await controller.acquire(2)
+
+    with (
+        patch.object(
+            controller._condition, "notify", wraps=controller._condition.notify
+        ) as notify_spy,
+        patch.object(
+            controller._condition, "notify_all", wraps=controller._condition.notify_all
+        ) as notify_all_spy,
+    ):
+        await controller.release(2, latency_ms=1.0, status_code=200, timed_out=False)
+
+    notify_spy.assert_called_once_with(2)
+    notify_all_spy.assert_not_called()
 
 
 async def test_fixed_controller_records_latency_only_on_success():
@@ -233,6 +278,49 @@ async def test_adaptive_controller_limit_increase_unblocks_waiting_acquire():
 
     await asyncio.wait_for(waiter, timeout=1.0)
     assert waiter.done()
+
+
+async def test_adaptive_controller_release_wakes_bounded_number_of_waiters():
+    """Same wake-storm guard as FixedController's equivalent test: a single
+    release(1) must admit exactly one of several queued cost=1 waiters."""
+    controller = AdaptiveController(_adaptive_config(initial_concurrency=1))
+    await controller.acquire(1)
+
+    waiters = [asyncio.ensure_future(controller.acquire(1)) for _ in range(3)]
+
+    await controller.release(1, latency_ms=1.0, status_code=200, timed_out=False)
+    done, pending = await asyncio.wait(waiters, timeout=0.05)
+    assert len(done) == 1
+    assert len(pending) == 2
+
+    await controller.release(1, latency_ms=1.0, status_code=200, timed_out=False)
+    done2, pending2 = await asyncio.wait(pending, timeout=0.05)
+    assert len(done2) == 1
+    assert len(pending2) == 1
+
+    for waiter in pending2:
+        waiter.cancel()
+    for waiter in pending2:
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+
+async def test_adaptive_controller_release_calls_notify_with_cost_not_notify_all():
+    controller = AdaptiveController(_adaptive_config(initial_concurrency=2))
+    await controller.acquire(2)
+
+    with (
+        patch.object(
+            controller._condition, "notify", wraps=controller._condition.notify
+        ) as notify_spy,
+        patch.object(
+            controller._condition, "notify_all", wraps=controller._condition.notify_all
+        ) as notify_all_spy,
+    ):
+        await controller.release(2, latency_ms=1.0, status_code=200, timed_out=False)
+
+    notify_spy.assert_called_once_with(2)
+    notify_all_spy.assert_not_called()
 
 
 async def test_adaptive_controller_adjust_loop_applies_one_step_then_cools_down():
