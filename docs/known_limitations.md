@@ -73,6 +73,54 @@ rather than silently assumed:
   `backend_timeout_seconds`/`health_check_interval_seconds` as its primaries — there is no separate,
   more-lenient cadence or timeout for the standby tier.
 
+## Single-process deployment: no OS-level resource limits configured
+
+The AAC runs as a single process, single asyncio event loop, single CPU core — `Dockerfile:27`'s
+`CMD` starts `uvicorn` with no `--workers` flag, and `docker-compose.yml` sets no `ulimits:`,
+`mem_limit`, or `deploy.resources` block. No code path enforces an inbound-connection cap either;
+the only ceiling on client→AAC connections is the OS/uvloop accept queue.
+
+Every other concurrency/connection limit in the system is deliberately configured, but each at a
+different layer, with no single place documenting how they compose:
+
+| Layer | Limit | Source |
+|---|---|---|
+| Inbound (client→AAC) | None enforced by the app | no code caps this |
+| Per-backend queue | `queue_max_size` (config, e.g. 5000 for search APIs, 100 for `pywb-patching`) | `app/scheduler.py:46` |
+| Per-backend concurrency | `concurrency_limit` (fixed) or `min/initial/max_concurrency` (adaptive, self-tunes on p95/timeout/error rate) | `app/capacity.py:52` (fixed), `app/capacity.py:111-113` (adaptive) |
+| Outbound (AAC→upstream) | `max_connections=200×instance_count`, `max_keepalive_connections=50×instance_count`, one `httpx.AsyncClient` per backend | `app/dispatcher.py:61-72` |
+| Redis | `redis.asyncio.from_url()` with no `max_connections` override → defaults to redis-py's own **100**, shared by every backend/dimension | `app/main.py:65` |
+| GeoIP | 2 mmap'd file descriptors for the whole process (not per-request), plus a 10k-entry in-memory LRU cache | `app/geoip.py:43-44,71-74` |
+
+Two consequences worth calling out explicitly:
+
+- **Redis's default 100-connection pool is the tightest shared ceiling in the system.** Every
+  scoring dimension, for every backend, funnels through `RedisPenaltyStore.increment_and_get()`
+  (`app/penalty_store.py:20-27`) against that one shared pool — under heavy multi-backend load this
+  is the first thing likely to queue up, not file descriptors or any single backend's
+  `concurrency_limit`.
+- **File descriptors are not sized for real concurrency.** Default Docker/most Linux distros ship
+  `ulimit -n 1024`. Every concurrently in-flight request costs roughly 2 FDs (1 inbound client
+  socket + 1 outbound upstream socket; Redis is pooled, not per-request), on top of whatever the
+  httpx keep-alive pools hold open idle (up to `200×instance_count` per backend). A few thousand
+  concurrent in-flight requests across all backends exceeds 1024 well before any configured
+  `concurrency_limit` would reject — and `docker-compose.yml` has no `ulimits:` override today.
+
+Because the process is single-core/single-event-loop, synchronous CPU-bound work also blocks every
+other in-flight request for its duration — there is no multi-core parallelism without running
+multiple worker processes. The main candidates for CPU-bound work in this codebase: JWT/JWKS RSA
+signature verification (`app/auth.py`), GeoIP mmap lookups on a cache miss (`app/geoip.py`), and
+JSON log serialization per request (`app/observability.py`). Moving to multiple workers/processes
+is not a free change, though: it needs the sticky-session state (see "Multi-instance load balancing
+scope limits" above) moved out of in-process memory first — a second worker process would not share
+the first's `LeastLoadedLoadBalancer` state.
+
+`scripts/load_test.py` is the existing tool for probing all of this, but it has gaps if used to
+validate real ceilings: single URL only (can't drive multiple backends at once), no ramp-up (slams
+`--concurrency` immediately), doesn't hold connections open/idle to test sustained-connection
+ceilings, and is itself single-process (so the load generator becomes the bottleneck before the AAC
+does) — see `scripts/load_test.py:9-14`.
+
 ## Everything else is resolved
 
 The original design's open-TBD list (`docs/old/open_tbd.md`) additionally tracked the Solr/Search

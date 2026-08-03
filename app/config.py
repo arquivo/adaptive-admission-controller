@@ -36,6 +36,10 @@ class Settings(BaseSettings):
 
     config_path: Path = Path("config/backends.yaml")
     redis_url: str = "redis://localhost:6379/0"
+    # redis-py's own default (`ConnectionPool.__init__`'s `max_connections = max_connections or
+    # 100`) is otherwise implicit and shared by every backend/scoring dimension — see
+    # docs/known_limitations.md's single-process/no-OS-limits entry.
+    redis_max_connections: int = 100
     log_level: str = "INFO"
     # Bearer token for `/admin/*` (FR-081/FR-084) — unset/empty means those
     # routes fail closed with 403 rather than defaulting to open access.

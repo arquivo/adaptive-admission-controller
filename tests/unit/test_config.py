@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.config import AACConfig, AdaptiveBackendConfig, FixedBackendConfig, load_config
+from app.config import AACConfig, AdaptiveBackendConfig, FixedBackendConfig, Settings, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -14,6 +14,15 @@ def test_real_backends_yaml_parses_cleanly():
     config = load_config(REPO_ROOT / "config" / "backends.yaml")
     assert len(config.backends) == 6
     assert len(config.scoring.default_penalties.user) == 2
+
+
+def test_redis_max_connections_defaults_to_100():
+    assert Settings().redis_max_connections == 100
+
+
+def test_redis_max_connections_env_override(monkeypatch):
+    monkeypatch.setenv("AAC_REDIS_MAX_CONNECTIONS", "250")
+    assert Settings().redis_max_connections == 250
 
 
 def test_discriminated_union_assigns_correct_backend_types(base_config_dict):

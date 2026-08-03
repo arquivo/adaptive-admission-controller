@@ -186,3 +186,56 @@ placeholders.
 
 `image-search-api` currently mirrors `page-search-api` as a placeholder — no separate baseline
 exists yet; treat it as the least-validated row in this table.
+
+### Local load-test results (single-box Docker Compose)
+
+Run 2026-08-03 as part of `docs/scaling_remediation_plan.md` item 4, using the enhanced
+`scripts/load_test.py` from inside the `aac` container (so the client's source IP is `127.0.0.1`,
+matching `ingress.trusted_proxies`) against `docker compose up`, one backend
+(`concurrency_limit: 300`, `queue_max_size: 2000`), and a threaded stub upstream with a large
+listen backlog (plain `python -m http.server`'s default backlog of 5 saturates well before the AAC
+does and produces misleading 502s — see caveat below). This is a single developer laptop, not
+representative production hardware; treat the absolute numbers as directional, not a promise.
+
+| Offered concurrency | Throughput | p50 | p95 | p99 | Rejected (429/503) |
+|---|---|---|---|---|---|
+| 50 | 327 req/s | 145 ms | 193 ms | 257 ms | 0% |
+| 100 | 313 req/s | 303 ms | 439 ms | 552 ms | 0% |
+| 150 | 185 req/s | 737 ms | 1139 ms | 1205 ms | 0% |
+| 200 | 100 req/s | 2010 ms | 2423 ms | 2519 ms | 0% |
+| 250 | 80 req/s | 2978 ms | 4285 ms | 4591 ms | 0% |
+
+**Finding: throughput *drops* as offered concurrency rises past ~100-150, with zero rejections at
+any level tested.** That inversion — more concurrent clients producing *fewer* completed
+requests/sec, not just higher latency — rules out the two most obvious explanations: it isn't
+`queue_max_size` rejecting (0% 429s throughout, `admission_queue_size` was back to 0 between runs),
+and it isn't FD exhaustion (`/proc/net/sockstat` showed ~100 TCP sockets in use against the raised
+65536 ulimit). `docker stats` showed the `aac` container's single process pinned at 110-165% CPU
+during the degraded runs, confirming this is CPU-bound contention inside the process itself, not a
+resource ceiling from items 1-2.
+
+The likely mechanism: `app/capacity.py`'s `FixedController`/`AdaptiveController.acquire()`/
+`release()` are built on a single shared `asyncio.Condition` per backend, and `release()` calls
+`notify_all()` on every completed request — waking *every* currently-blocked waiter so each can
+re-acquire the condition's lock and re-check its predicate, even though only one (at most a few) can
+actually proceed. As offered concurrency grows past the configured `concurrency_limit`, the number
+of waiters woken per release grows with it, so the overhead of *rejecting* wake-ups scales with
+however many clients are queued — a wake-storm, not useful work. This wasn't something the original
+items 1-4 (FD limits, Redis pool sizing, load-test tooling) were scoped to touch; it surfaced only
+because item 4 asked to actually run a real load test and look at what breaks first.
+
+Two production backends (`page-search-api`, `image-search-api`) already configure `max_concurrency:
+300` in the table above — per this measurement, either one approaching that ceiling in real traffic
+would hit the same wall this test found at a single backend's ~150 concurrent in-flight requests,
+well before reaching its own configured limit.
+
+Feeding this back into `docs/scaling_remediation_plan.md`'s item 5 section: **this is CPU-bound
+contention, but not the kind item 5 (multi-worker/multi-process scale-out) was written to address.**
+It's a single-process algorithmic inefficiency (an `O(waiters)` wake-storm on every release), not
+inherent single-core saturation from legitimate request-handling work — the actual proxied requests
+in these runs were fast (the stub backend answered in single-digit milliseconds). A synchronization
+primitive that wakes only the waiters that can actually proceed (e.g. an `asyncio.Semaphore`, whose
+`release()` wakes exactly one waiter in FIFO order, rather than a `Condition` + `notify_all()`) is a
+much smaller, cheaper fix than multi-process scale-out, and would need to land and be re-measured
+before item 5's bigger, product-sign-off-gated question (sticky-session state needing to move to
+Redis, per-worker lifespan duplication) is worth revisiting at all.

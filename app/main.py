@@ -62,7 +62,9 @@ def _build_lifespan(preloaded_config: AACConfig | None):
 
         app.state.config = config
         app.state.admin_api_token = settings.admin_api_token
-        app.state.redis = redis_asyncio.from_url(settings.redis_url)
+        app.state.redis = redis_asyncio.from_url(
+            settings.redis_url, max_connections=settings.redis_max_connections
+        )
         app.state.geoip = GeoIPLookup(config.geoip.city_db_path, config.geoip.asn_db_path)
         app.state.auth = JWTVerifier(config.auth)
         await app.state.auth.initial_fetch()
